@@ -23,9 +23,10 @@ case "$(uname -m)" in
     *) echo 'Unsupported architecture.' >&2; exit 1 ;;
 esac
 case "${SHELL:-}" in
-    */zsh) profile=${ZDOTDIR:-$HOME}/.zshrc ;;
-    */bash) profile=$HOME/.bashrc ;;
-    *) echo 'Use this installer from a bash or zsh login account.' >&2; exit 1 ;;
+    */zsh) profile=${ZDOTDIR:-$HOME}/.zshrc; line='export PATH="$HOME/.local/opt/herdr-rootshell/bin:$PATH" # rootshell-herdr' ;;
+    */bash) profile=$HOME/.bashrc; line='export PATH="$HOME/.local/opt/herdr-rootshell/bin:$PATH" # rootshell-herdr' ;;
+    */fish) profile=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/rootshell-herdr.fish; line='fish_add_path --path $HOME/.local/opt/herdr-rootshell/bin # rootshell-herdr' ;;
+    *) echo 'Use this installer from a bash, zsh, or fish login account.' >&2; exit 1 ;;
 esac
 asset=herdr-$os-$arch
 base=https://github.com/kitknox/herdr/releases/download/$tag
@@ -43,7 +44,7 @@ dest=$HOME/.local/opt/herdr-rootshell/bin
 mkdir -p "$dest"
 install -m 755 "$tmp/$asset" "$dest/herdr.new"
 mv -f "$dest/herdr.new" "$dest/herdr"
-line='export PATH="$HOME/.local/opt/herdr-rootshell/bin:$PATH" # rootshell-herdr'
+mkdir -p "$(dirname "$profile")"
 if ! grep -Fqx "$line" "$profile" 2>/dev/null; then
     printf '\n%s\n' "$line" >> "$profile"
 fi
