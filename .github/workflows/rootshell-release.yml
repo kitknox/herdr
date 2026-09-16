@@ -141,15 +141,13 @@ jobs:
           prerelease: true
           generate_release_notes: true
           body: |
-            Fork build of Herdr for Rootshell control mode.
+            Rootshell v0.1.6 updates the fork to Herdr v0.9.1 while preserving control mode, shared terminal attaches, and geometry ownership.
 
-            Fix persistent terminal layout artifacts after resizing during active output. Control-mode snapshots now preserve erased rows and their soft-wrap state, keeping subsequent output and resizing aligned.
+            Preserves terminal colors, blank and wrapped rows, cursor appearance, and tab stops when restoring control-mode snapshots with the updated terminal engine.
 
-            The macOS/Linux installer now supports fish login shells and keeps its PATH changes scoped to shell startup so removing the startup snippet restores the official installation.
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.6`.
 
-            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.5`.
-
-            Updating the binary keeps compatible running servers active. Save work, then restart the server to use the corrected snapshot handling; stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this release.
+            Existing servers keep running their previous binary. Save work before restarting: stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this release.
 
             Install on macOS/Linux:
             ```sh
