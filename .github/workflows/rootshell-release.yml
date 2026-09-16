@@ -146,11 +146,13 @@ jobs:
           body: |
             Fork build of Herdr for Rootshell control mode.
 
-            Improve terminal redraw recovery after terminal size changes. Herdr sends one follow-up resize notification after geometry settles, helping applications recover when they miss the initial event. New resizes replace the pending notification, while typed input and geometry ownership remain intact.
+            Fix persistent terminal layout artifacts after resizing during active output. Control-mode snapshots now preserve erased rows and their soft-wrap state, keeping subsequent output and resizing aligned.
 
-            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.4`.
+            The macOS/Linux installer now supports fish login shells and keeps its PATH changes scoped to shell startup so removing the startup snippet restores the official installation.
 
-            Updating the binary keeps compatible running servers active. Save work, then restart the server to use the updated resize handling; stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this release.
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.5`.
+
+            Updating the binary keeps compatible running servers active. Save work, then restart the server to use the corrected snapshot handling; stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this release.
 
             Install on macOS/Linux:
             ```sh
