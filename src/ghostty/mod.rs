@@ -1151,6 +1151,16 @@ impl Terminal {
         Ok((wide, graphemes))
     }
 
+    pub(crate) fn screen_row_wrap(&self, y: u32) -> Result<bool, Error> {
+        let grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+        Ok(grid_ref_wrap_state(&grid_ref)?.0)
+    }
+
+    pub(crate) fn screen_cell_wide(&self, x: u16, y: u32) -> Result<CellWide, Error> {
+        let grid_ref = self.grid_ref(ghostty_screen_point(x, y))?;
+        grid_ref_wide(&grid_ref)
+    }
+
     pub(crate) fn screen_text_rows(&self) -> Result<Vec<ScreenTextRow>, Error> {
         self.screen_text_rows_range(0, usize::MAX)
     }

@@ -3100,14 +3100,91 @@ fn raw_primary_ansi(terminal: &crate::ghostty::Terminal) -> Result<String, crate
         if row.is_empty() {
             continue;
         }
-        let mut text =
-            terminal.read_ansi_screen((0, 0), (cols.saturating_sub(1), end as u32), false, true)?;
+        let mut text = raw_primary_content_ansi(terminal, cols, end as u32)?;
         for _ in end + 1..total_rows {
             text.push_str("\r\n");
         }
         return Ok(text);
     }
     Ok(String::new())
+}
+
+/// Unwrapped text alone cannot represent an erased wrap continuation:
+/// the formatter elides its incoming wrap, then emits just one CRLF for the
+/// empty row, collapsing two physical rows into one. Keep normal text runs
+/// unwrapped, but recreate blank rows and their wrap flags explicitly. This
+/// is snapshot-only work; ordinary PTY output remains a raw byte stream.
+fn raw_primary_content_ansi(
+    terminal: &crate::ghostty::Terminal,
+    cols: u16,
+    end: u32,
+) -> Result<String, crate::ghostty::Error> {
+    use crate::ghostty::CellWide;
+
+    let last_col = cols.saturating_sub(1);
+    let mut text = String::new();
+    let mut start = 0;
+    let mut y = 0;
+    while y < end {
+        if !terminal
+            .read_ansi_screen((0, y), (last_col, y), false, true)?
+            .is_empty()
+        {
+            y += 1;
+            continue;
+        }
+        if start < y {
+            text.push_str(&terminal.read_ansi_screen(
+                (0, start),
+                (last_col, y - 1),
+                false,
+                true,
+            )?);
+            if terminal.screen_row_wrap(y - 1)? {
+                let wide = terminal.screen_cell_wide(last_col, y - 1)?;
+                if wide == CellWide::SpacerHead {
+                    // Recreate the wide-character spacer at the previous
+                    // right edge. The temporary glyph is erased below.
+                    text.push_str(&format!("\x1b[{cols}G\x1b[0m\u{3000}"));
+                } else {
+                    let x = if wide == CellWide::SpacerTail {
+                        last_col.saturating_sub(1)
+                    } else {
+                        last_col
+                    };
+                    let cell =
+                        terminal.read_ansi_screen((x, y - 1), (last_col, y - 1), false, false)?;
+                    text.push_str(&format!("\x1b[{}G\x1b[0m", x + 1));
+                    text.push_str(if cell.is_empty() { " " } else { &cell });
+                    // CUP/CHA clear pending-wrap; repaint the final cell and
+                    // print one temporary cell to actually enter the blank row.
+                    text.push_str("\x1b[0m ");
+                }
+            } else {
+                text.push_str("\r\n");
+            }
+        }
+        text.push_str("\x1b[0m");
+        while y < end
+            && terminal
+                .read_ansi_screen((0, y), (last_col, y), false, true)?
+                .is_empty()
+        {
+            text.push_str("\x1b[2K\r");
+            if terminal.screen_row_wrap(y)? {
+                // EL2 preserves wrap flags. Establish the outgoing wrap,
+                // then erase the temporary last-column space before this
+                // row can scroll into history. This also preserves reflow.
+                text.push_str(&format!("\x1b[{cols}G  \x1b[A\x1b[2K\x1b[B\r"));
+            } else {
+                text.push_str("\r\n");
+            }
+            y += 1;
+        }
+        start = y;
+    }
+    text.push_str(&terminal.read_ansi_screen((0, start), (last_col, end), false, true)?);
+    Ok(text)
 }
 
 /// Keep at most `limit` trailing bytes of history, cut on a line boundary
@@ -5654,6 +5731,55 @@ mod tests {
         assert_eq!(core.terminal.cursor_y().unwrap(), original_row);
         let after = core.terminal.cell_ansi(0, 19, 4).unwrap();
         assert!(after.contains("after"), "row4: {after:?}");
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_erased_wrap_continuations_and_later_reflow() {
+        for history in [false, true] {
+            for prefix in [
+                format!("{}x\x1b[2K\r\nEND", "a".repeat(80)),
+                format!("{}🙂\x1b[2K\r\nEND", "a".repeat(79)),
+                format!("{}🙂x\x1b[2K\r\nEND", "a".repeat(78)),
+                format!(
+                    "{}\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[4;1HEND",
+                    "a".repeat(240)
+                ),
+            ] {
+                let history_bytes = if history {
+                    format!("{}\x1b[2J\x1b[H", "history\r\n".repeat(30))
+                } else {
+                    String::new()
+                };
+                let source = snapshot_test_pane(format!("{history_bytes}{prefix}").as_bytes());
+                let snapshot = source.raw_snapshot(0, 1 << 20, None, None).unwrap();
+                let restored = replay_test_snapshot(&source, b"stale screen");
+                let cursor = format!("\x1b[{};{}H", snapshot.cursor.y + 1, snapshot.cursor.x + 1);
+                let mut source = source.core.lock().unwrap();
+                let mut restored = restored.core.lock().unwrap();
+                restored.terminal.write(cursor.as_bytes());
+                // Reflow again after replay: inserting plain newlines fixes
+                // the immediate picture but loses soft-wrap state.
+                for cols in [80, 64, 96, 80] {
+                    source.terminal.resize(cols, 24, 0, 0).unwrap();
+                    restored.terminal.resize(cols, 24, 0, 0).unwrap();
+                    let rows = source.terminal.total_rows().unwrap();
+                    assert_eq!(restored.terminal.total_rows().unwrap(), rows);
+                    for y in 0..rows as u32 {
+                        assert_eq!(
+                            restored
+                                .terminal
+                                .read_ansi_screen((0, y), (cols - 1, y), false, false)
+                                .unwrap(),
+                            source
+                                .terminal
+                                .read_ansi_screen((0, y), (cols - 1, y), false, false)
+                                .unwrap(),
+                            "history={history} cols={cols} row={y} input={prefix:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// With history above the screen and blank rows under the content, the
