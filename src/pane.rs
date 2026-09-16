@@ -54,10 +54,20 @@ pub use self::{
     terminal::{ScrollMetrics, TerminalCursorState},
 };
 
+pub(crate) struct TerminalDirtyPatchSnapshot {
+    pub patch: TerminalDirtyPatchOutcome,
+    pub content_revision: u64,
+    pub scroll_metrics: Option<ScrollMetrics>,
+    pub mouse_reporting: bool,
+    pub sgr_pixel_mouse: bool,
+    pub alternate_screen_active: bool,
+    pub graphics_may_have_placements: bool,
+}
+
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
 const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
-const PANE_TERM: &str = "xterm-256color";
+pub(crate) const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
@@ -139,6 +149,9 @@ impl PaneLaunchEnv {
 
 fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env_remove("CODEX_THREAD_ID");
+    // OMP sets OMPCODE for shells it spawns. A pane launched from inside OMP
+    // must not inherit it or its root agent would look like a nested session.
+    cmd.env_remove("OMPCODE");
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
@@ -1067,7 +1080,7 @@ impl TerminalCompressionWake {
 /// Drives libghostty-vt's caller-owned compression after terminal activity settles.
 struct TerminalCompressionTask {
     wake: TerminalCompressionWake,
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     completed_passes: Arc<AtomicU64>,
     handle: tokio::task::AbortHandle,
 }
@@ -1086,9 +1099,9 @@ impl TerminalCompressionTask {
         };
         let task_notify = wake.notify.clone();
         let task_generation = wake.generation.clone();
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         let completed_passes = Arc::new(AtomicU64::new(0));
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         let task_completed_passes = completed_passes.clone();
         let handle = tokio::spawn(async move {
             run_terminal_compression_task(
@@ -1096,7 +1109,7 @@ impl TerminalCompressionTask {
                 terminal,
                 task_notify,
                 task_generation,
-                #[cfg(test)]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 task_completed_passes,
             )
             .await;
@@ -1104,7 +1117,7 @@ impl TerminalCompressionTask {
         .abort_handle();
         Self {
             wake,
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             completed_passes,
             handle,
         }
@@ -1122,7 +1135,7 @@ impl TerminalCompressionTask {
         self.handle.abort();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn completed_passes(&self) -> u64 {
         self.completed_passes.load(Ordering::Acquire)
     }
@@ -1133,7 +1146,9 @@ async fn run_terminal_compression_task(
     terminal: Arc<PaneTerminal>,
     notify: Arc<Notify>,
     generation: Arc<AtomicU64>,
-    #[cfg(test)] completed_passes: Arc<AtomicU64>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))] completed_passes: Arc<
+        AtomicU64,
+    >,
 ) {
     let mut observed_generation = generation.load(Ordering::Acquire);
     let mut activity = loop {
@@ -1216,7 +1231,7 @@ async fn run_terminal_compression_task(
                 TerminalCompressionStep::Compressed(
                     crate::ghostty::TerminalCompressionResult::Complete,
                 ) => {
-                    #[cfg(test)]
+                    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                     completed_passes.fetch_add(1, Ordering::Release);
                     loop {
                         notify.notified().await;
@@ -1720,26 +1735,59 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
 /// prompt would show success after a failed command (verified on 5.1).
 pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $loc.ProviderPath } catch {}; $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
 
+/// Login flags appended when launching POSIX-style shells on Windows.
+///
+/// `portable-pty`'s default-program path resolves to `%ComSpec%` (cmd.exe) on
+/// Windows and ignores the `SHELL` env override, and the Unix argv0-prefix
+/// login convention does not exist there. A login shell therefore has to be
+/// launched directly with the shell's own login flag. Only POSIX-style shells
+/// that define one (the sh family, fish, and csh/tcsh) get it; Windows-native
+/// shells such as cmd.exe and PowerShell have no login concept and launch
+/// plain.
+fn windows_login_shell_args(shell: &str) -> &'static [&'static str] {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "sh" | "bash" | "zsh" | "ksh" | "dash" | "ash" | "mksh" | "fish" | "csh" | "tcsh" => {
+            &["-l"]
+        }
+        _ => &[],
+    }
+}
+
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
-    if shell_mode_uses_login_shell(shell_config.mode, target) {
+    // Unix login shells go through portable-pty's default-program builder so
+    // they receive the login argv0 convention. Windows has no such convention
+    // and the default-program builder would launch cmd.exe, so Windows login
+    // shells are built directly below like every other direct-shell target.
+    if shell_mode_uses_login_shell(shell_config.mode, target)
+        && target != ShellLaunchTarget::Windows
+    {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
-        Ok(cmd)
-    } else {
-        let mut cmd = CommandBuilder::new(&shell);
-        if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
-            cmd.args([
-                "-NoExit",
-                "-Command",
-                WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
-            ]);
-        }
-        Ok(cmd)
+        return Ok(cmd);
     }
+
+    let mut cmd = CommandBuilder::new(&shell);
+    if shell_mode_uses_login_shell(shell_config.mode, target) {
+        cmd.args(windows_login_shell_args(&shell));
+    }
+    if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
+        cmd.args([
+            "-NoExit",
+            "-Command",
+            WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
+        ]);
+    }
+    Ok(cmd)
 }
 
 fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<CommandBuilder> {
@@ -1757,8 +1805,10 @@ fn uses_windows_powershell_pane_shell_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> bool {
+    // Login mode no longer routes Windows through the default-program builder,
+    // so login PowerShell panes are launched directly and can carry the same
+    // prompt-based cwd reporting as non-login panes.
     target == ShellLaunchTarget::Windows
-        && !shell_mode_uses_login_shell(shell_config.mode, target)
         && is_powershell_shell(&pane_shell(shell_config.default_shell))
 }
 
@@ -1977,7 +2027,7 @@ impl PaneRuntime {
         let windows_powershell_prompt_cwd_reporting =
             uses_windows_powershell_pane_shell(shell_config);
         let mut cmd = pane_shell_command_builder(shell_config)?;
-        cmd.cwd(cwd);
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -2019,7 +2069,7 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
-        cmd.cwd(cwd);
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -2066,7 +2116,7 @@ impl PaneRuntime {
         for arg in args {
             cmd.arg(arg);
         }
-        cmd.cwd(cwd);
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
@@ -3022,7 +3072,7 @@ impl PaneRuntime {
         result
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub fn input_state(&self) -> Option<InputState> {
         self.terminal.input_state()
     }
@@ -3140,16 +3190,53 @@ impl PaneRuntime {
         self.terminal.render(frame, area, show_cursor);
     }
 
-    pub(crate) fn collect_dirty_patch(
+    pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,
         area_height: u16,
-    ) -> TerminalDirtyPatchOutcome {
-        self.terminal.collect_dirty_patch(area_width, area_height)
+    ) -> Option<TerminalDirtyPatchSnapshot> {
+        // PTY/resize writers announce changes before locking the terminal core.
+        // Exclude them until rows and metadata have been paired with their revision.
+        let _content_guard = self
+            .content_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = self.content_seq();
+        if !revision.is_multiple_of(2) {
+            return None;
+        }
+        let patch = self.terminal.collect_dirty_patch(area_width, area_height);
+        if matches!(patch, TerminalDirtyPatchOutcome::Fallback) {
+            return None;
+        }
+        let snapshot = TerminalDirtyPatchSnapshot {
+            patch,
+            content_revision: revision,
+            scroll_metrics: self.scroll_metrics(),
+            mouse_reporting: self.mouse_reporting_enabled(),
+            sgr_pixel_mouse: self.sgr_pixel_mouse_enabled(),
+            alternate_screen_active: self.alternate_screen_active(),
+            graphics_may_have_placements: crate::kitty_graphics::is_enabled()
+                && self.kitty_graphics_may_have_placements(),
+        };
+        (self.content_seq() == revision).then_some(snapshot)
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.terminal.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.terminal.link_regions_at(col, row, resolve)
+    }
+
+    pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
+        self.terminal.link_target_at(col, row)
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
@@ -3487,6 +3574,60 @@ impl PaneRuntime {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
 
+    pub(crate) fn test_contend_during_dirty_collection(
+        &self,
+        bytes: Vec<u8>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        let terminal = self.terminal.clone();
+        let sequence = self.content_seq.clone();
+        let write_lock = self.content_write_lock.clone();
+        let pane_id = self.pane_id;
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.terminal
+            .ghostty
+            .core
+            .lock()
+            .unwrap()
+            .dirty_collection_hook = Some(Box::new(move || {
+            start_tx.send(()).unwrap();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }));
+        let writer = std::thread::spawn(move || {
+            start_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let guard = match write_lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(error) => panic!("poisoned content lock: {error}"),
+            };
+            let announced = guard.is_some();
+            if announced {
+                sequence.fetch_add(1, Ordering::AcqRel);
+                assert!(matches!(
+                    terminal.ghostty.core.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            }
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            let _guard = guard.unwrap_or_else(|| {
+                let guard = write_lock.lock().unwrap();
+                sequence.fetch_add(1, Ordering::AcqRel);
+                guard
+            });
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = terminal.process_pty_bytes(pane_id, 0, &bytes, &tx);
+            sequence.fetch_add(1, Ordering::Release);
+            announced
+        });
+        (release_tx, writer)
+    }
+
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
@@ -3749,6 +3890,63 @@ mod tests {
         assert_eq!(kept, "語");
     }
 
+    #[tokio::test]
+    async fn dirty_patch_snapshot_keeps_clean_metadata_and_terminal_fallback() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("initial snapshot");
+        runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1016h");
+        let snapshot = runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("mode snapshot");
+        assert!(matches!(snapshot.patch, TerminalDirtyPatchOutcome::Clean));
+        assert_eq!(snapshot.content_revision, runtime.content_seq());
+        assert!(snapshot.content_revision.is_multiple_of(2));
+        assert!(snapshot.mouse_reporting);
+        assert!(snapshot.sgr_pixel_mouse);
+        assert!(!snapshot.alternate_screen_active);
+
+        runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        assert!(runtime.collect_dirty_patch_snapshot(20, 4).is_none());
+        assert!(runtime.content_write_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dirty_patch_snapshot_tracks_serialized_scroll_and_resize() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            20,
+            4,
+            100_000,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix",
+        );
+        runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("live snapshot");
+        runtime.scroll_up(1);
+        let scrolled = runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("scrolled snapshot");
+        assert_eq!(
+            scrolled.scroll_metrics.expect("metrics").offset_from_bottom,
+            1
+        );
+        runtime.scroll_reset();
+        runtime.resize(5, 24, 0, 0);
+        let resized = runtime
+            .collect_dirty_patch_snapshot(24, 5)
+            .expect("resized snapshot");
+        let metrics = resized.scroll_metrics.expect("resized metrics");
+        assert_eq!(metrics.offset_from_bottom, 0);
+        assert_eq!(metrics.viewport_rows, 5);
+        assert!(resized.content_revision.is_multiple_of(2));
+        let TerminalDirtyPatchOutcome::Patch(patch) = resized.patch else {
+            panic!("resize must dirty the viewport");
+        };
+        assert_eq!(patch.rows.len(), 5);
+        assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 24));
+    }
+
     #[test]
     fn pane_launch_env_removes_outer_codex_thread_id() {
         let mut cmd = CommandBuilder::new("shell");
@@ -3757,6 +3955,16 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    #[test]
+    fn pane_launch_env_removes_outer_ompcode_marker() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("OMPCODE", "1");
+
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+
+        assert!(cmd.get_env("OMPCODE").is_none());
     }
 
     #[test]
@@ -3998,6 +4206,122 @@ mod tests {
     }
 
     #[test]
+    fn windows_login_shell_builder_launches_configured_shell_with_login_flag() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("bash.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(
+            !cmd.is_default_prog(),
+            "Windows login mode must not fall back to the default program (cmd.exe)"
+        );
+        assert_eq!(
+            cmd.get_argv(),
+            &[
+                std::ffi::OsString::from("bash.exe"),
+                std::ffi::OsString::from("-l"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_login_shell_builder_launches_native_shells_without_flag() {
+        for shell in ["cmd.exe", "C:\\Windows\\System32\\cmd.exe"] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert!(!cmd.is_default_prog(), "shell {shell:?}");
+            assert_eq!(
+                cmd.get_argv(),
+                &[std::ffi::OsString::from(shell)],
+                "shell {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_powershell_builder_injects_prompt_cwd_shell_integration() {
+        for shell in [
+            "powershell.exe",
+            "pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cmd.get_argv(),
+                &[
+                    std::ffi::OsString::from(shell),
+                    std::ffi::OsString::from("-NoExit"),
+                    std::ffi::OsString::from("-Command"),
+                    std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+                ],
+                "shell {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_shell_args_maps_posix_shells_to_login_flag() {
+        for shell in [
+            "sh",
+            "sh.exe",
+            "bash",
+            "bash.exe",
+            "BASH.EXE",
+            "zsh",
+            "zsh.exe",
+            "ksh",
+            "dash",
+            "ash",
+            "mksh",
+            "fish",
+            "fish.exe",
+            "csh",
+            "csh.exe",
+            "tcsh",
+            "tcsh.exe",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_args(shell),
+                &["-l"],
+                "shell {shell:?} should get the login flag"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_shell_args_omits_flag_for_shells_without_login_concept() {
+        for shell in [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "nu",
+            "nu.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_args(shell),
+                &[] as &[&str],
+                "shell {shell:?} must not get a login flag"
+            );
+        }
+    }
+
+    #[test]
     fn auto_shell_builder_keeps_direct_shell_on_non_macos_target() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Auto),
@@ -4089,26 +4413,31 @@ mod tests {
     }
 
     #[test]
-    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
-        let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
-        assert!(uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::Windows
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::OtherUnix
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::Macos
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
-            ShellLaunchTarget::Windows
-        ));
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_powershell() {
+        for mode in [
+            crate::config::ShellModeConfig::NonLogin,
+            crate::config::ShellModeConfig::Login,
+        ] {
+            let pwsh = PaneShellConfig::new("pwsh.exe", mode);
+            assert!(
+                uses_windows_powershell_pane_shell_for_target(pwsh, ShellLaunchTarget::Windows),
+                "mode {mode:?}"
+            );
+            assert!(!uses_windows_powershell_pane_shell_for_target(
+                pwsh,
+                ShellLaunchTarget::OtherUnix
+            ));
+            assert!(!uses_windows_powershell_pane_shell_for_target(
+                pwsh,
+                ShellLaunchTarget::Macos
+            ));
+        }
         assert!(!uses_windows_powershell_pane_shell_for_target(
             PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::Login),
             ShellLaunchTarget::Windows
         ));
     }

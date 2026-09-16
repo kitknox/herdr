@@ -265,16 +265,46 @@ pub(super) fn effective_sgr_pixel_mouse(
     enabled && requested && exact_geometry
 }
 
+#[cfg(any(windows, test))]
+fn set_windows_native_mouse_capture<W: io::Write>(
+    writer: &mut W,
+    enabled: bool,
+    sgr_pixels: bool,
+    set_console_capture: impl FnOnce(bool) -> io::Result<()>,
+) -> io::Result<()> {
+    crate::terminal_modes::clear_host_mouse_reporting(writer)?;
+    set_console_capture(enabled)?;
+    if enabled {
+        crate::terminal_modes::set_windows_mouse_reporting(writer, true, sgr_pixels)?;
+    }
+    Ok(())
+}
+
 pub(super) fn set_mouse_capture(enabled: bool, sgr_pixels: bool) -> io::Result<()> {
-    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     #[cfg(windows)]
     if is_ssh_session() && windows_vti_input_backend_enabled() {
-        return crate::terminal_modes::set_windows_ssh_mouse_reporting(
+        crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
+        return crate::terminal_modes::set_windows_mouse_reporting(
             &mut io::stdout(),
             enabled,
             sgr_pixels,
         );
     }
+    #[cfg(windows)]
+    return set_windows_native_mouse_capture(&mut io::stdout(), enabled, sgr_pixels, |enabled| {
+        if enabled {
+            execute!(io::stdout(), EnableMouseCapture)
+        } else {
+            match execute!(io::stdout(), DisableMouseCapture) {
+                Ok(()) => Ok(()),
+                Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
+                Err(err) => Err(err),
+            }
+        }
+    });
+    #[cfg(not(windows))]
+    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
+    #[cfg(not(windows))]
     if enabled {
         execute!(io::stdout(), EnableMouseCapture)?;
         if sgr_pixels {
@@ -285,8 +315,6 @@ pub(super) fn set_mouse_capture(enabled: bool, sgr_pixels: bool) -> io::Result<(
     } else {
         match execute!(io::stdout(), DisableMouseCapture) {
             Ok(()) => Ok(()),
-            #[cfg(windows)]
-            Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -376,11 +404,11 @@ fn pop_keyboard_enhancement_flags() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn windows_win32_input_mode_enabled() -> bool {
+#[cfg(any(windows, test))]
+pub(super) fn windows_win32_input_mode_enabled() -> bool {
     std::env::var("HERDR_WINDOWS_INPUT_PROBE")
         .map(|probe| probe.eq_ignore_ascii_case("win32"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -441,5 +469,74 @@ impl Drop for TerminalGuard {
                 self.restore_windows_input_mode,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedOutput(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl io::Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn windows_native_mouse_capture_never_resets_encoding_after_native_enable() {
+        let mut output = SharedOutput::default();
+        for sgr_pixels in [false, false, true, false] {
+            let start = output.0.borrow().len();
+            let native_output = output.clone();
+            let native_boundary = std::cell::Cell::new(0);
+            set_windows_native_mouse_capture(&mut output, true, sgr_pixels, |enabled| {
+                assert!(enabled);
+                // ConPTY enables host SGR during native capture, before our VT requests.
+                native_output
+                    .0
+                    .borrow_mut()
+                    .extend_from_slice(b"\x1b[?1003h\x1b[?1006h");
+                native_boundary.set(native_output.0.borrow().len());
+                Ok(())
+            })
+            .unwrap();
+
+            let bytes = output.0.borrow();
+            let before = std::str::from_utf8(&bytes[start..native_boundary.get()]).unwrap();
+            let after = std::str::from_utf8(&bytes[native_boundary.get()..]).unwrap();
+            assert!(before.contains("\x1b[?1016l"));
+            for reset in ["\x1b[?1005l", "\x1b[?1006l", "\x1b[?1016l"] {
+                assert!(
+                    !after.contains(reset),
+                    "mouse format reset after native capture (sgr_pixels={sgr_pixels}): {after:?}"
+                );
+            }
+            assert!(after.contains("\x1b[?1003h\x1b[?1006h"));
+            assert_eq!(after.contains("\x1b[?1016h"), sgr_pixels);
+        }
+    }
+
+    #[test]
+    fn windows_native_mouse_capture_restores_reporting_after_reset() {
+        let mut output = Vec::new();
+
+        set_windows_native_mouse_capture(&mut output, true, false, |enabled| {
+            assert!(enabled);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            output,
+            b"\x1b[?1006l\x1b[?1016l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?9l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+        );
     }
 }

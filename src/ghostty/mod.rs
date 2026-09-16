@@ -146,12 +146,12 @@ pub const MOD_CTRL: u16 = ffi::GHOSTTY_MODS_CTRL as u16;
 pub const MOD_ALT: u16 = ffi::GHOSTTY_MODS_ALT as u16;
 pub const MOD_SUPER: u16 = ffi::GHOSTTY_MODS_SUPER as u16;
 
-pub const KEY_ENTER: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ENTER;
-pub const KEY_UP: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP;
-pub const KEY_DOWN: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN;
-pub const KEY_LEFT: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_LEFT;
-pub const KEY_RIGHT: u32 = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_RIGHT;
-pub const KEY_A: u32 = ffi::GhosttyKey_GHOSTTY_KEY_A;
+pub const KEY_ENTER: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ENTER;
+pub const KEY_UP: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_UP;
+pub const KEY_DOWN: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_DOWN;
+pub const KEY_LEFT: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_LEFT;
+pub const KEY_RIGHT: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_ARROW_RIGHT;
+pub const KEY_A: ffi::GhosttyKey = ffi::GhosttyKey_GHOSTTY_KEY_A;
 
 pub const MOUSE_ACTION_PRESS: ffi::GhosttyMouseAction =
     ffi::GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS;
@@ -343,6 +343,14 @@ pub struct CursorViewport {
     pub x: u16,
     pub y: u16,
     pub wide_tail: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderCursor {
+    pub viewport: Option<CursorViewport>,
+    pub visible: bool,
+    pub blinking: bool,
+    pub visual_style: CursorVisualStyle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -557,12 +565,25 @@ unsafe extern "C" fn clipboard_write_trampoline(
     _terminal: ffi::GhosttyTerminal,
     userdata: *mut c_void,
     write: *const ffi::GhosttyClipboardWrite,
-) -> ffi::GhosttyClipboardWriteResult {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+) {
+    if write.is_null() || unsafe { (*write).size } < mem::size_of::<ffi::GhosttyClipboardWrite>() {
+        return;
+    }
+    // The reply and request are borrowed only until this callback returns.
+    let Some(reply) = (unsafe { (*write).reply }) else {
+        return;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: libghostty-vt owns these values for the synchronous callback.
         unsafe { capture_clipboard_write(userdata, write) }
     }))
-    .unwrap_or(ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA)
+    .unwrap_or(ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA);
+    let response = ffi::GhosttyClipboardWriteReply {
+        size: mem::size_of::<ffi::GhosttyClipboardWriteReply>(),
+        result,
+        remember: false,
+    };
+    unsafe { reply(write, &response) };
 }
 
 unsafe fn capture_clipboard_write(
@@ -785,6 +806,12 @@ pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
     Ok(buffer)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LinkTarget {
+    Uri(String),
+    Text { text: String, clicked_byte: usize },
+}
+
 pub struct Terminal {
     raw: ffi::GhosttyTerminal,
     max_scrollback: usize,
@@ -798,14 +825,9 @@ pub struct Terminal {
 impl Terminal {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, Error> {
         let mut raw = ptr::null_mut();
-        let options = ffi::GhosttyTerminalOptions {
-            cols,
-            rows,
-            max_scrollback,
-        };
-        // SAFETY: valid out pointer and options, null allocator means default allocator.
+        // SAFETY: valid out pointer, null allocator means default allocator.
         unsafe {
-            ffi::ghostty_terminal_new(ptr::null(), &mut raw, options).into_result()?;
+            ffi::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows).into_result()?;
         }
 
         let mut terminal = Self {
@@ -826,7 +848,35 @@ impl Terminal {
         };
         let userdata = (&mut *terminal.callback_state as *mut TerminalCallbackState).cast();
         let glyph_protocol = false;
+        let terminfo_name = ffi::GhosttyString {
+            ptr: crate::pane::PANE_TERM.as_ptr().cast(),
+            len: crate::pane::PANE_TERM.len(),
+        };
+        let grapheme_default = ffi::GhosttyTerminalModeConfig {
+            mode: MODE_GRAPHEME_CLUSTER,
+            value: true,
+        };
+        let clipboard_callback: ffi::GhosttyTerminalClipboardWriteFn =
+            Some(clipboard_write_trampoline);
         unsafe {
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_TERMINFO_NAME,
+                (&terminfo_name as *const ffi::GhosttyString).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                (&max_scrollback as *const usize).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_MODE_DEFAULT,
+                (&grapheme_default as *const ffi::GhosttyTerminalModeConfig).cast(),
+            )
+            .into_result()?;
             ffi::ghostty_terminal_set(
                 terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
@@ -854,7 +904,7 @@ impl Terminal {
             ffi::ghostty_terminal_set(
                 terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
-                (clipboard_write_trampoline as *const ()).cast(),
+                clipboard_callback.map_or(ptr::null(), |callback| (callback as *const ()).cast()),
             )
             .into_result()?;
             ffi::ghostty_terminal_set(
@@ -978,6 +1028,12 @@ impl Terminal {
         install_png_decoder_once();
         let storage_limit = KITTY_IMAGE_STORAGE_LIMIT_BYTES;
         let enable_medium = true;
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.to_string_lossy();
+        let temp_dir = ffi::GhosttyString {
+            ptr: temp_dir.as_ptr().cast(),
+            len: temp_dir.len(),
+        };
         unsafe {
             ffi::ghostty_terminal_set(
                 self.raw,
@@ -994,7 +1050,7 @@ impl Terminal {
             ffi::ghostty_terminal_set(
                 self.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
-                (&enable_medium as *const bool).cast(),
+                (&temp_dir as *const ffi::GhosttyString).cast(),
             )
             .into_result()?;
             ffi::ghostty_terminal_set(
@@ -1052,13 +1108,28 @@ impl Terminal {
     }
 
     pub fn mode_get(&self, mode: u16) -> Result<bool, Error> {
-        let mut out = false;
-        unsafe { ffi::ghostty_terminal_mode_get(self.raw, mode, &mut out).into_result()? };
-        Ok(out)
+        let mut config = ffi::GhosttyTerminalModeConfig { mode, value: false };
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.raw,
+                ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MODE,
+                (&mut config as *mut ffi::GhosttyTerminalModeConfig).cast(),
+            )
+            .into_result()?;
+        }
+        Ok(config.value)
     }
 
     pub fn mode_set(&mut self, mode: u16, value: bool) -> Result<(), Error> {
-        unsafe { ffi::ghostty_terminal_mode_set(self.raw, mode, value).into_result() }
+        let config = ffi::GhosttyTerminalModeConfig { mode, value };
+        unsafe {
+            ffi::ghostty_terminal_set(
+                self.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_MODE,
+                (&config as *const ffi::GhosttyTerminalModeConfig).cast(),
+            )
+            .into_result()
+        }
     }
 
     pub fn kitty_keyboard_flags(&self) -> Result<u8, Error> {
@@ -1216,6 +1287,187 @@ impl Terminal {
         grid_ref_hyperlink_uri(&grid_ref)
     }
 
+    pub(crate) fn viewport_link_target(&self, x: u16, y: u32) -> Result<Option<LinkTarget>, Error> {
+        Ok(self
+            .viewport_link_selection(x, y)?
+            .map(|(target, _)| target))
+    }
+
+    fn viewport_link_selection(
+        &self,
+        x: u16,
+        y: u32,
+    ) -> Result<Option<(LinkTarget, Option<ffi::GhosttySelection>)>, Error> {
+        let mut clicked = self.grid_ref(ghostty_viewport_point(x, y))?;
+        if grid_ref_wide(&clicked)? == CellWide::SpacerTail {
+            clicked.x = clicked.x.saturating_sub(1);
+        }
+        if let Some(uri) = grid_ref_hyperlink_uri(&clicked)? {
+            return Ok(Some((LinkTarget::Uri(uri), None)));
+        }
+        let graphemes = grid_ref_graphemes(&clicked)?;
+        if graphemes
+            .first()
+            .copied()
+            .and_then(char::from_u32)
+            .is_none_or(char::is_whitespace)
+        {
+            return Ok(None);
+        }
+        // Unicode White_Space, matching Rust's char::is_whitespace URL boundaries.
+        const BOUNDARIES: &[u32] = &[
+            9, 10, 11, 12, 13, 32, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004,
+            0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+        ];
+        let options = ffi::GhosttyTerminalSelectWordOptions {
+            size: mem::size_of::<ffi::GhosttyTerminalSelectWordOptions>(),
+            ref_: clicked,
+            boundary_codepoints: BOUNDARIES.as_ptr(),
+            boundary_codepoints_len: BOUNDARIES.len(),
+        };
+        let mut selection = ffi::GhosttySelection::default();
+        // Bound work before formatting, even for an unbroken scrollback-sized token.
+        let result = unsafe {
+            ffi::ghostty_terminal_select_word_bounded(self.raw, &options, 8192, &mut selection)
+        };
+        if result == ffi::GhosttyResult_GHOSTTY_NO_VALUE {
+            return Ok(None);
+        }
+        result.into_result()?;
+        let text = self.format_selection(&selection, FormatterFormat::Plain, true, false)?;
+        let prefix = self.format_selection(
+            &ffi::GhosttySelection {
+                end: clicked,
+                ..selection
+            },
+            FormatterFormat::Plain,
+            true,
+            false,
+        )?;
+        let clicked_len: usize = graphemes
+            .into_iter()
+            .filter_map(char::from_u32)
+            .map(char::len_utf8)
+            .sum();
+        Ok(Some((
+            LinkTarget::Text {
+                text,
+                clicked_byte: prefix.len().saturating_sub(clicked_len),
+            },
+            Some(selection),
+        )))
+    }
+
+    /// Resolve only the bounded plain-text token. OSC 8 regions are resolved by
+    /// clients from frame hyperlink IDs; their full URI activation path is unchanged.
+    pub(crate) fn viewport_link_regions(
+        &self,
+        x: u16,
+        y: u32,
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Result<Vec<crate::api::schema::PaneLinkRegion>, Error> {
+        let cols = self.cols()?;
+        let rows = self.rows()?;
+        if x >= cols || y >= u32::from(rows) {
+            return Ok(Vec::new());
+        }
+        let Some((LinkTarget::Text { text, clicked_byte }, Some(selection))) =
+            self.viewport_link_selection(x, y)?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(range) = resolve(&text, clicked_byte) else {
+            return Ok(Vec::new());
+        };
+        let point =
+            |grid_ref: &ffi::GhosttyGridRef, clipped: (u16, u32)| -> Result<(u16, u32), Error> {
+                let mut out = ffi::GhosttyPointCoordinate::default();
+                let result = unsafe {
+                    ffi::ghostty_terminal_point_from_grid_ref(
+                        self.raw,
+                        grid_ref,
+                        ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
+                        &mut out,
+                    )
+                };
+                if result == ffi::GhosttyResult_GHOSTTY_NO_VALUE {
+                    return Ok(clipped);
+                }
+                result.into_result()?;
+                // C viewport coordinates can extend below the visible viewport
+                // when scrolled up. Clip those as well as NO_VALUE endpoints.
+                if out.y >= u32::from(rows) {
+                    return Ok(clipped);
+                }
+                Ok((out.x, out.y))
+            };
+        // The selected token contains the visible hovered cell, so an invisible
+        // start/end necessarily lies above/below the viewport respectively.
+        let (start_col, start_row) = point(&selection.start, (0, 0))?;
+        let (end_col, end_row) = point(&selection.end, (cols - 1, u32::from(rows - 1)))?;
+        let first = self.grid_ref(ghostty_viewport_point(start_col, start_row))?;
+        let cell_len = |cell: &ffi::GhosttyGridRef| -> Result<usize, Error> {
+            if matches!(
+                grid_ref_wide(cell)?,
+                CellWide::SpacerHead | CellWide::SpacerTail
+            ) {
+                return Ok(0);
+            }
+            Ok(grid_ref_graphemes(cell)?
+                .into_iter()
+                .filter_map(char::from_u32)
+                .map(char::len_utf8)
+                .sum())
+        };
+        // Format a prefix once, not once per cell. Then walk only the selected
+        // visible cells, retaining one page/grid lookup per row.
+        let prefix = self.format_selection(
+            &ffi::GhosttySelection {
+                end: first,
+                ..selection
+            },
+            FormatterFormat::Plain,
+            true,
+            false,
+        )?;
+        let mut byte = prefix.len().saturating_sub(cell_len(&first)?);
+        let mut regions: Vec<crate::api::schema::PaneLinkRegion> = Vec::new();
+        for row in start_row..=end_row {
+            let mut cell = self.grid_ref(ghostty_viewport_point(0, row))?;
+            let left = if row == start_row { start_col } else { 0 };
+            let right = if row == end_row { end_col } else { cols - 1 };
+            for col in left..=right {
+                cell.x = col;
+                let wide = grid_ref_wide(&cell)?;
+                if matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail) {
+                    continue;
+                }
+                let len = cell_len(&cell)?;
+                if byte < range.end && byte + len > range.start {
+                    let end = if wide == CellWide::Wide {
+                        (col + 1).min(cols - 1)
+                    } else {
+                        col
+                    };
+                    if let Some(last) = regions
+                        .last_mut()
+                        .filter(|last| u32::from(last.row) == row && last.end_col + 1 == col)
+                    {
+                        last.end_col = end;
+                    } else {
+                        regions.push(crate::api::schema::PaneLinkRegion {
+                            row: row as u16,
+                            start_col: col,
+                            end_col: end,
+                        });
+                    }
+                }
+                byte += len;
+            }
+        }
+        Ok(regions)
+    }
+
     fn grid_ref(&self, point: ffi::GhosttyPoint) -> Result<ffi::GhosttyGridRef, Error> {
         let mut grid_ref = ffi::GhosttyGridRef {
             size: mem::size_of::<ffi::GhosttyGridRef>(),
@@ -1346,8 +1598,8 @@ impl Terminal {
         Ok(ansi)
     }
 
-    /// The formatter always emits content ahead of the extras, so format
-    /// one cell with and without them and keep only what the extras added.
+    /// Format one cell with and without extras and remove the cell. Tabstop
+    /// setup precedes content; the remaining requested extras follow it.
     fn format_state_only_ansi(
         &self,
         extra: ffi::GhosttyFormatterTerminalExtra,
@@ -1378,10 +1630,22 @@ impl Terminal {
                 ..Default::default()
             },
         )?;
-        Ok(with_state
+        let (prefix, content_and_state) = if extra.tabstops {
+            // The tabstop prefix contains only CSI 3 g, CSI n G, and HTS,
+            // followed by this home command. Never search for the cell text:
+            // it could also occur inside an escape sequence.
+            let end = with_state
+                .find("\x1b[H")
+                .ok_or(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?
+                + "\x1b[H".len();
+            with_state.split_at(end)
+        } else {
+            ("", with_state.as_str())
+        };
+        let state = content_and_state
             .strip_prefix(content_only.as_str())
-            .map(str::to_owned)
-            .unwrap_or(with_state))
+            .ok_or(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?;
+        Ok(format!("{prefix}{state}"))
     }
 
     fn format_state_ansi(
@@ -1464,6 +1728,16 @@ impl Terminal {
             end: end_ref,
             rectangle,
         };
+        self.format_selection(&selection, format, unwrap, trim)
+    }
+
+    fn format_selection(
+        &self,
+        selection: &ffi::GhosttySelection,
+        format: FormatterFormat,
+        unwrap: bool,
+        trim: bool,
+    ) -> Result<String, Error> {
         let mut formatter: ffi::GhosttyFormatter = ptr::null_mut();
         let options = ffi::GhosttyFormatterTerminalOptions {
             size: mem::size_of::<ffi::GhosttyFormatterTerminalOptions>(),
@@ -1478,7 +1752,7 @@ impl Terminal {
                 },
                 ..Default::default()
             },
-            selection: &selection,
+            selection,
         };
         unsafe {
             ffi::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.raw, options)
@@ -2659,43 +2933,34 @@ impl RenderState {
         Ok(Dirty::from_raw(out))
     }
 
-    pub fn cursor_visible(&self) -> Result<bool, Error> {
-        self.get_bool(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE)
-    }
-
-    pub fn cursor_blinking(&self) -> Result<bool, Error> {
-        self.get_bool(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING)
-    }
-
-    pub fn cursor_visual_style(&self) -> Result<CursorVisualStyle, Error> {
-        let mut out: ffi::GhosttyRenderStateCursorVisualStyle = 0;
-        // SAFETY: out points to the matching enum storage for the requested data kind.
+    pub fn cursor(&self) -> Result<RenderCursor, Error> {
+        let mut cursor = ffi::GhosttyRenderStateCursor {
+            size: mem::size_of::<ffi::GhosttyRenderStateCursor>(),
+            ..Default::default()
+        };
         unsafe {
             ffi::ghostty_render_state_get(
                 self.raw,
-                ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
-                (&mut out as *mut ffi::GhosttyRenderStateCursorVisualStyle).cast(),
+                ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR,
+                (&mut cursor as *mut ffi::GhosttyRenderStateCursor).cast(),
             )
             .into_result()?;
         }
-        Ok(CursorVisualStyle::from_raw(out))
-    }
-
-    pub fn cursor_viewport(&self) -> Result<Option<CursorViewport>, Error> {
-        if !self.get_bool(
-            ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
-        )? {
-            return Ok(None);
-        }
-        Ok(Some(CursorViewport {
-            x: self
-                .get_u16(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X)?,
-            y: self
-                .get_u16(ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y)?,
-            wide_tail: self.get_bool(
-                ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL,
-            )?,
-        }))
+        Ok(RenderCursor {
+            // Upstream leaves these fields undefined when the cursor is offscreen.
+            viewport: if cursor.viewport_has_value {
+                Some(CursorViewport {
+                    x: cursor.viewport_x,
+                    y: cursor.viewport_y,
+                    wide_tail: cursor.wide_tail,
+                })
+            } else {
+                None
+            },
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            visual_style: CursorVisualStyle::from_raw(cursor.visual_style),
+        })
     }
 
     pub fn colors(&self) -> Result<RenderColors, Error> {
@@ -2704,13 +2969,22 @@ impl RenderState {
             ..Default::default()
         };
         unsafe {
-            ffi::ghostty_render_state_colors_get(self.raw, &mut colors).into_result()?;
+            ffi::ghostty_render_state_get(
+                self.raw,
+                ffi::GhosttyRenderStateData_GHOSTTY_RENDER_STATE_DATA_COLORS,
+                (&mut colors as *mut ffi::GhosttyRenderStateColors).cast(),
+            )
+            .into_result()?;
         }
         Ok(RenderColors {
             background: colors.background.into(),
             foreground: colors.foreground.into(),
             palette: colors.palette.map(Into::into),
         })
+    }
+
+    pub fn clean(&mut self) -> Result<(), Error> {
+        unsafe { ffi::ghostty_render_state_clean(self.raw).into_result() }
     }
 
     pub fn set_dirty(&mut self, dirty: Dirty) -> Result<(), Error> {
@@ -2754,15 +3028,6 @@ impl RenderState {
         }
         Ok(out)
     }
-
-    fn get_bool(&self, data: ffi::GhosttyRenderStateData) -> Result<bool, Error> {
-        let mut out = false;
-        unsafe {
-            ffi::ghostty_render_state_get(self.raw, data, (&mut out as *mut bool).cast())
-                .into_result()?;
-        }
-        Ok(out)
-    }
 }
 
 // SAFETY: these opaque handles are only used behind external synchronization in pane runtime.
@@ -2792,7 +3057,7 @@ impl KeyEvent {
         unsafe { ffi::ghostty_key_event_set_action(self.raw, action) }
     }
 
-    pub fn set_key(&mut self, key: u32) {
+    pub fn set_key(&mut self, key: ffi::GhosttyKey) {
         unsafe { ffi::ghostty_key_event_set_key(self.raw, key) }
     }
 
@@ -3009,6 +3274,14 @@ impl<'a> RowIter<'a> {
     pub fn next(&mut self) -> bool {
         // SAFETY: iterator handle is valid while self is alive.
         unsafe { ffi::ghostty_render_state_row_iterator_next(self.iterator.raw) }
+    }
+
+    pub fn next_dirty(&mut self) -> Option<u16> {
+        let mut y = 0u16;
+        // SAFETY: iterator is live and y matches the viewport-coordinate output type.
+        let advanced =
+            unsafe { ffi::ghostty_render_state_row_iterator_next_dirty(self.iterator.raw, &mut y) };
+        advanced.then_some(y)
     }
 
     pub fn dirty(&self) -> Result<bool, Error> {
@@ -3459,6 +3732,7 @@ impl<'a> RowCellIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {
@@ -3578,8 +3852,8 @@ mod tests {
             .generation;
         assert_ne!(first_generation, 0);
 
-        // Same id and size, different pixels.
-        terminal.write(b"\x1b_Ga=t,f=32,t=d,i=7,s=1,v=1,q=2;AAAAAA==\x1b\\");
+        // Retransmission removes old placements; transmit-and-display replaces it.
+        terminal.write(b"\x1b[H\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=10,r=5,q=2;AAAAAA==\x1b\\");
         let second = terminal
             .kitty_image_placements_with_data_filter(|_| true)
             .unwrap();
@@ -3651,7 +3925,11 @@ mod tests {
         terminal.scroll_viewport_row(0);
         assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
 
+        // Delete-visible must preserve images in scrollback, even while viewed.
         terminal.write(b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(terminal.kitty_graphics_generation().unwrap(), placed);
+        assert_eq!(terminal.kitty_image_placements().unwrap().len(), 1);
+        terminal.write(b"\x1b_Ga=d,d=I,i=1\x1b\\");
         let deleted = terminal.kitty_graphics_generation().unwrap();
         assert_ne!(deleted, placed);
         assert!(terminal.kitty_graphics_may_have_placements().unwrap());
@@ -3705,9 +3983,20 @@ mod tests {
         assert!(terminal
             .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE)
             .unwrap());
-        assert!(terminal
-            .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE)
-            .unwrap());
+        let mut temp_dir = ffi::GhosttyString::default();
+        unsafe {
+            ffi::ghostty_terminal_get(
+                terminal.raw,
+                ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+                (&mut temp_dir as *mut ffi::GhosttyString).cast(),
+            )
+            .into_result()
+            .unwrap();
+            assert_eq!(
+                borrowed_bytes(temp_dir).unwrap(),
+                std::env::temp_dir().to_string_lossy().as_bytes()
+            );
+        }
         assert!(terminal
             .get_bool(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM)
             .unwrap());
@@ -3908,6 +4197,118 @@ mod tests {
     }
 
     #[test]
+    fn link_target_includes_offscreen_wrapped_rows() {
+        let url = "https://example.com/abcdefghijklmnopqrstuv";
+        let mut terminal = Terminal::new(20, 2, 1024 * 1024).unwrap();
+        terminal.write(url.as_bytes());
+        let expected = LinkTarget::Text {
+            text: url.to_owned(),
+            clicked_byte: 20,
+        };
+        assert_eq!(terminal.viewport_link_target(0, 0).unwrap(), Some(expected));
+        terminal.scroll_viewport_row(0);
+        assert_eq!(
+            terminal.viewport_link_target(0, 0).unwrap(),
+            Some(LinkTarget::Text {
+                text: url.to_owned(),
+                clicked_byte: 0
+            })
+        );
+    }
+
+    #[test]
+    fn link_target_prefers_explicit_uri_and_does_not_join_hard_lines() {
+        let mut terminal = Terminal::new(20, 4, 1024).unwrap();
+        terminal.write(b"\x1b]8;;https://example.com/real\x1b\\label\x1b]8;;\x1b\\\r\nhttps://example.com/\r\ntail");
+        assert_eq!(
+            terminal.viewport_link_target(2, 0).unwrap(),
+            Some(LinkTarget::Uri("https://example.com/real".into()))
+        );
+        assert_eq!(
+            terminal.viewport_link_target(1, 2).unwrap(),
+            Some(LinkTarget::Text {
+                text: "tail".into(),
+                clicked_byte: 1
+            })
+        );
+    }
+
+    #[test]
+    fn link_target_stops_at_hard_line_when_clicking_last_column() {
+        let mut terminal = Terminal::new(20, 3, 1024).unwrap();
+        terminal.write(b"https://example.com/x\r\nnot-part-of-url");
+        assert_eq!(
+            terminal.viewport_link_target(19, 0).unwrap(),
+            Some(LinkTarget::Text {
+                text: "https://example.com/x".into(),
+                clicked_byte: 19
+            })
+        );
+    }
+
+    #[test]
+    fn link_target_wide_explicit_label_works_on_both_cell_halves() {
+        let mut terminal = Terminal::new(20, 2, 1024).unwrap();
+        terminal.write("\x1b]8;;https://example.com/\x1b\\路径\x1b]8;;\x1b\\".as_bytes());
+        for col in 0..4 {
+            assert_eq!(
+                terminal.viewport_link_target(col, 0).unwrap(),
+                Some(LinkTarget::Uri("https://example.com/".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn link_target_selection_budget_is_shared_across_both_directions() {
+        let mut terminal = Terminal::new(20, 2, 1024).unwrap();
+        terminal.write(b" abc ");
+        let boundaries = [u32::from(b' ')];
+        let options = ffi::GhosttyTerminalSelectWordOptions {
+            size: mem::size_of::<ffi::GhosttyTerminalSelectWordOptions>(),
+            ref_: terminal.grid_ref(ghostty_viewport_point(2, 0)).unwrap(),
+            boundary_codepoints: boundaries.as_ptr(),
+            boundary_codepoints_len: boundaries.len(),
+        };
+        for budget in 0..=5 {
+            let mut selection = ffi::GhosttySelection::default();
+            let result = unsafe {
+                ffi::ghostty_terminal_select_word_bounded(
+                    terminal.raw,
+                    &options,
+                    budget,
+                    &mut selection,
+                )
+            };
+            if budget < 5 {
+                assert_eq!(
+                    result,
+                    ffi::GhosttyResult_GHOSTTY_NO_VALUE,
+                    "budget={budget}"
+                );
+            } else {
+                result.into_result().unwrap();
+                assert_eq!(
+                    terminal
+                        .format_selection(&selection, FormatterFormat::Plain, true, false)
+                        .unwrap(),
+                    "abc"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn link_target_rejects_oversized_token_without_returning_a_prefix() {
+        let mut terminal = Terminal::new(100, 4, 16 * 1024 * 1024).unwrap();
+        let text = format!("https://example.com/{}", "a".repeat(1_000_000));
+        terminal.write(text.as_bytes());
+        let started = std::time::Instant::now();
+        let target = terminal.viewport_link_target(0, 0).unwrap();
+        eprintln!("million-byte token lookup: {:?}", started.elapsed());
+        assert!(target.is_none());
+    }
+
+    #[test]
     fn terminal_read_text_viewport_unwraps_soft_wrapped_selection() {
         let mut terminal = Terminal::new(5, 3, 0).unwrap();
         terminal.write("1ABCD2EFGH3IJKL".as_bytes());
@@ -4039,6 +4440,59 @@ mod tests {
     }
 
     #[test]
+    fn raw_resize_preserves_content_without_replaying_terminal_effects() {
+        let mut terminal = Terminal::new(20, 6, 100_000).unwrap();
+        terminal.write(b"header\r\n\x1b[6;1Htail\x1b[6;18H");
+        for (cols, rows) in [(10, 3), (30, 8), (8, 4), (20, 6)] {
+            terminal.resize(cols, rows, 8, 16).unwrap();
+            terminal.write(b"X");
+            let text = terminal
+                .read_text_screen(
+                    (0, 0),
+                    (cols - 1, terminal.total_rows().unwrap() as u32 - 1),
+                    false,
+                )
+                .unwrap();
+            assert!(
+                text.contains("tail"),
+                "lost tail after {cols}x{rows}: {text:?}"
+            );
+            assert_eq!(text.matches("tail").count(), 1);
+            assert!(terminal.cursor_y().unwrap() < rows);
+        }
+        terminal.write(b"\x1b[2J\x1b[H");
+        terminal.resize(12, 3, 8, 16).unwrap();
+        assert!(terminal
+            .read_text_viewport((0, 0), (11, 2), false)
+            .unwrap()
+            .trim()
+            .is_empty());
+    }
+
+    #[test]
+    fn clipboard_queries_never_disclose_contents_and_split_writes_complete_once() {
+        for suffix in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let bytes = [b"\x1b]52;c;YQBi".as_slice(), suffix].concat();
+            for split in 0..=bytes.len() {
+                let mut terminal = Terminal::new(10, 3, 0).unwrap();
+                let replies = Arc::new(Mutex::new(Vec::new()));
+                let captured = Arc::clone(&replies);
+                terminal
+                    .set_write_pty_callback(move |bytes| {
+                        captured.lock().unwrap().extend_from_slice(bytes)
+                    })
+                    .unwrap();
+                terminal.write(&bytes[..split]);
+                terminal.write(&bytes[split..]);
+                assert_eq!(terminal.take_clipboard_writes(), vec![b"a\0b".to_vec()]);
+                terminal.write(b"\x1b]52;c;?\x07\x1b]52;p;YQBi\x07");
+                assert!(terminal.take_clipboard_writes().is_empty());
+                assert!(replies.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn active_screen_and_cursor_visibility_contract() {
         let mut terminal = Terminal::new(12, 3, 0).unwrap();
         let mut render_state = RenderState::new().unwrap();
@@ -4051,10 +4505,10 @@ mod tests {
         );
 
         render_state.update(&terminal).unwrap();
-        assert!(render_state.cursor_visible().unwrap());
+        assert!(render_state.cursor().unwrap().visible);
         terminal.write(b"\x1b[?25l");
         render_state.update(&terminal).unwrap();
-        assert!(!render_state.cursor_visible().unwrap());
+        assert!(!render_state.cursor().unwrap().visible);
 
         terminal.write(b"\x1b[?1049h\x1b[HALT");
         assert_eq!(terminal.active_screen().unwrap(), ActiveScreen::Alternate);
@@ -4137,6 +4591,8 @@ mod tests {
     fn grapheme_cluster_mode_is_default_and_survives_full_reset() {
         let mut terminal = Terminal::new(80, 3, 100).unwrap();
         assert!(terminal.mode_get(MODE_GRAPHEME_CLUSTER).unwrap());
+        terminal.mode_set(MODE_GRAPHEME_CLUSTER, false).unwrap();
+        assert!(!terminal.mode_get(MODE_GRAPHEME_CLUSTER).unwrap());
 
         terminal.write(b"\x1bc");
 
@@ -4178,8 +4634,21 @@ mod tests {
                 assert!(!rows.dirty().unwrap());
             }
         }
+        {
+            let mut iterator = RowIterator::new().unwrap();
+            let mut rows = render_state.populate_row_iterator(&mut iterator).unwrap();
+            assert_eq!(rows.next_dirty(), Some(0));
+            assert_eq!(rows.next_dirty(), Some(1));
+            assert_eq!(rows.next_dirty(), Some(2));
+            assert_eq!(rows.next_dirty(), None);
+        }
         render_state.set_dirty(Dirty::Clean).unwrap();
         assert_eq!(render_state.dirty().unwrap(), Dirty::Clean);
+        {
+            let mut iterator = RowIterator::new().unwrap();
+            let mut rows = render_state.populate_row_iterator(&mut iterator).unwrap();
+            assert_eq!(rows.next_dirty(), None);
+        }
 
         terminal.write(b"A");
         render_state.update(&terminal).unwrap();
@@ -4191,12 +4660,12 @@ mod tests {
             let mut rows = render_state
                 .populate_row_iterator(&mut row_iterator)
                 .unwrap();
-            while rows.next() {
-                if rows.dirty().unwrap() {
-                    dirty_rows += 1;
-                    rows.clear_dirty().unwrap();
-                    assert!(!rows.dirty().unwrap());
-                }
+            while let Some(y) = rows.next_dirty() {
+                assert_eq!(y, 0);
+                assert!(rows.dirty().unwrap());
+                dirty_rows += 1;
+                rows.clear_dirty().unwrap();
+                assert!(!rows.dirty().unwrap());
             }
         }
         assert_eq!(dirty_rows, 1);
@@ -4238,20 +4707,45 @@ mod tests {
         contents: &[ffi::GhosttyClipboardContent],
         size: usize,
     ) -> ffi::GhosttyClipboardWriteResult {
+        unsafe extern "C" fn reply(
+            request: *const ffi::GhosttyClipboardWrite,
+            response: *const ffi::GhosttyClipboardWriteReply,
+        ) {
+            let state = unsafe {
+                &mut *((*request).ctx as *mut (ffi::GhosttyClipboardWriteResult, bool, usize))
+            };
+            state.0 = unsafe { (*response).result };
+            state.1 = unsafe { (*response).remember };
+            state.2 += 1;
+        }
+        let mut response = (
+            ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA,
+            false,
+            0usize,
+        );
         let request = ffi::GhosttyClipboardWrite {
             size,
             location: ffi::GhosttyClipboardLocation_GHOSTTY_CLIPBOARD_LOCATION_STANDARD,
             contents: contents.as_ptr(),
             contents_len: contents.len(),
+            ctx: (&mut response as *mut (ffi::GhosttyClipboardWriteResult, bool, usize)).cast(),
+            reply: Some(reply),
+            ..Default::default()
         };
-        // SAFETY: the request and its borrowed content live through this call.
+        // SAFETY: the request, reply state and borrowed content live through this call.
         unsafe {
             clipboard_write_trampoline(
                 terminal.raw,
                 (&mut *terminal.callback_state as *mut TerminalCallbackState).cast(),
                 &request,
-            )
+            );
         }
+        assert_eq!(
+            response.2,
+            usize::from(size >= mem::size_of::<ffi::GhosttyClipboardWrite>())
+        );
+        assert!(!response.1, "migration must not create clipboard grants");
+        response.0
     }
 
     #[test]

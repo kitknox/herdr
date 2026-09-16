@@ -19,10 +19,7 @@ fn parse_kitty_key_sequence(data: &str) -> Option<TerminalKey> {
         .next()
         .filter(|field| !field.is_empty())
         .unwrap_or("1");
-    let associated_text = match fields.next() {
-        Some(value) => Some(parse_kitty_associated_text(value)?),
-        None => None,
-    };
+    let associated_text = fields.next();
     if fields.next().is_some() {
         return None;
     }
@@ -38,6 +35,14 @@ fn parse_kitty_key_sequence(data: &str) -> Option<TerminalKey> {
         .and_then(|field| field.parse::<u32>().ok());
 
     let code = kitty_codepoint_to_keycode(codepoint)?;
+    let associated_text = match associated_text {
+        Some(value) => match parse_kitty_associated_text(value) {
+            Some(text) => Some(text),
+            None if matching_control_associated_text(value, code) => None,
+            None => return None,
+        },
+        None => None,
+    };
     let kind = parse_kitty_event_type(event_type)?;
     let mut modifiers = key_modifiers_from_u8(modifier);
     // Kitty permits the shifted alternate only while Shift is active. Normalize
@@ -66,6 +71,19 @@ fn parse_kitty_associated_text(value: &str) -> Option<String> {
         text.push(ch);
     }
     (!text.is_empty()).then_some(text)
+}
+
+// WezTerm can attach the matching legacy control code in report-all mode even
+// though the Kitty protocol forbids control characters in associated text.
+// Keep the unambiguous key event, but never expose that field as generated text.
+fn matching_control_associated_text(value: &str, code: KeyCode) -> bool {
+    matches!(
+        (code, value),
+        (KeyCode::Enter, "13")
+            | (KeyCode::Backspace, "8")
+            | (KeyCode::Tab, "9")
+            | (KeyCode::Esc, "27")
+    )
 }
 
 #[allow(dead_code)] // Reserved for the upcoming raw stdin parser.
@@ -234,6 +252,10 @@ fn parse_xterm_modified_special_sequence(data: &str) -> Option<TerminalKey> {
         "3" => KeyCode::Delete,
         "5" => KeyCode::PageUp,
         "6" => KeyCode::PageDown,
+        "11" => KeyCode::F(1),
+        "12" => KeyCode::F(2),
+        "13" => KeyCode::F(3),
+        "14" => KeyCode::F(4),
         "15" => KeyCode::F(5),
         "17" => KeyCode::F(6),
         "18" => KeyCode::F(7),
@@ -293,6 +315,7 @@ fn kitty_codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         57361 => Some(KeyCode::PrintScreen),
         57362 => Some(KeyCode::Pause),
         57363 => Some(KeyCode::Menu),
+        57364..=57375 => Some(KeyCode::F((codepoint - 57364 + 1) as u8)),
         57376..=57398 => Some(KeyCode::F((codepoint - 57376 + 13) as u8)),
         57399 => Some(KeyCode::Char('0')),
         57400 => Some(KeyCode::Char('1')),
@@ -349,13 +372,8 @@ fn kitty_codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         57452 => Some(KeyCode::Modifier(ModifierKeyCode::RightMeta)),
         57453 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel3Shift)),
         57454 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel5Shift)),
-        value if is_kitty_functional_codepoint(value) => None,
         value => char::from_u32(value).map(KeyCode::Char),
     }
-}
-
-fn is_kitty_functional_codepoint(codepoint: u32) -> bool {
-    (57358..=57454).contains(&codepoint)
 }
 
 #[allow(dead_code)] // Reserved for the upcoming raw stdin parser.
@@ -623,9 +641,31 @@ mod tests {
             crossterm::event::KeyEventKind::Press,
             None,
         );
-        assert_eq!(parse_terminal_key_sequence("\x1b[11;2~"), None);
-        assert_eq!(parse_terminal_key_sequence("\x1b[14;1~"), None);
-        assert_eq!(parse_terminal_key_sequence("\x1b[14;3~"), None);
+    }
+
+    #[test]
+    fn parse_parameterized_csi_tilde_f1_through_f4() {
+        // foot and some rxvt-style hosts emit F1-F4 as `CSI <code>;<mods>~`
+        // (for example F3 as `\x1b[13;1:1~`), reusing the same code table as the
+        // unmodified `\x1b[11~`..`\x1b[14~` forms.
+        let cases = [
+            ("\x1b[11;2~", KeyCode::F(1), KeyModifiers::SHIFT),
+            ("\x1b[12;1~", KeyCode::F(2), KeyModifiers::empty()),
+            ("\x1b[13;1:1~", KeyCode::F(3), KeyModifiers::empty()),
+            ("\x1b[13;2~", KeyCode::F(3), KeyModifiers::SHIFT),
+            ("\x1b[14;3~", KeyCode::F(4), KeyModifiers::ALT),
+        ];
+
+        for (sequence, code, modifiers) in cases {
+            let parsed = parse_terminal_key_sequence(sequence).unwrap();
+            assert_terminal_key_eq(
+                parsed,
+                code,
+                modifiers,
+                crossterm::event::KeyEventKind::Press,
+                None,
+            );
+        }
     }
 
     #[test]
@@ -710,11 +750,60 @@ mod tests {
     }
 
     #[test]
+    fn parse_wezterm_control_associated_text_keeps_report_all_key_events() {
+        for (sequence, expected_code, expected_kind) in [
+            (
+                "\x1b[13;1;13u",
+                KeyCode::Enter,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[13;1:3u",
+                KeyCode::Enter,
+                crossterm::event::KeyEventKind::Release,
+            ),
+            (
+                "\x1b[127::8;1;8u",
+                KeyCode::Backspace,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[127::8;1:3u",
+                KeyCode::Backspace,
+                crossterm::event::KeyEventKind::Release,
+            ),
+            (
+                "\x1b[27;1;27u",
+                KeyCode::Esc,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[9;1;9u",
+                KeyCode::Tab,
+                crossterm::event::KeyEventKind::Press,
+            ),
+        ] {
+            let key = parse_terminal_key_sequence(sequence).expect("captured key should parse");
+            assert_eq!(key.code, expected_code);
+            assert_eq!(key.modifiers, KeyModifiers::empty());
+            assert_eq!(key.kind, expected_kind);
+            assert_eq!(key.generated_text, None);
+        }
+    }
+
+    #[test]
     fn reject_malformed_kitty_associated_text() {
         assert_eq!(parse_terminal_key_sequence("\x1b[32;;1114112u"), None);
         assert_eq!(parse_terminal_key_sequence("\x1b[32;;20320:bad:u"), None);
         assert_eq!(parse_terminal_key_sequence("\x1b[32;;27u"), None);
         assert_eq!(parse_terminal_key_sequence("\x1b[32;;133u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[13;1;8u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[127::8;1;13u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[13;1;13:10u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[9;1;27u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[27;1;9u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[9;1;9:97u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[27;1;27:27u"), None);
     }
 
     #[test]
@@ -949,8 +1038,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kitty_functional_key_remains_unsupported() {
-        assert!(parse_terminal_key_sequence("\x1b[57364;1u").is_none());
+    fn kitty_f1_through_f12_codepoints_are_recognized() {
+        let cases = [
+            ("\x1b[57364;1u", KeyCode::F(1)),
+            ("\x1b[57365;1u", KeyCode::F(2)),
+            ("\x1b[57366;1u", KeyCode::F(3)),
+            ("\x1b[57367;1u", KeyCode::F(4)),
+            ("\x1b[57368;1u", KeyCode::F(5)),
+            ("\x1b[57375;1u", KeyCode::F(12)),
+            ("\x1b[57376;1u", KeyCode::F(13)),
+        ];
+
+        for (sequence, code) in cases {
+            let parsed = parse_terminal_key_sequence(sequence).unwrap();
+            assert_terminal_key_eq(
+                parsed,
+                code,
+                KeyModifiers::empty(),
+                crossterm::event::KeyEventKind::Press,
+                None,
+            );
+        }
     }
 
     fn assert_fixture_corpus_parses(corpus: &str) {

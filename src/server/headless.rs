@@ -786,7 +786,7 @@ impl HeadlessServer {
         // rendering semantics. Force one fresh frame to every remaining client
         // even if the next rendered buffer compares equal to its cached frame.
         for client in self.clients.values_mut() {
-            client.request_repaint();
+            client.request_recompute();
         }
         if !start_pending_agent_resumes {
             self.app.pending_agent_resume_deadline = None;
@@ -799,7 +799,7 @@ impl HeadlessServer {
             .start_pending_agent_resumes(self.app.pending_agent_resume_due(now))
         {
             for client in self.clients.values_mut() {
-                client.request_repaint();
+                client.request_recompute();
             }
         }
     }
@@ -1492,11 +1492,17 @@ impl HeadlessServer {
         sources: &HashSet<crate::layout::PaneId>,
     ) -> (bool, bool) {
         let focused_source = self
-            .app
-            .state
-            .active
-            .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
-            .and_then(|workspace| workspace.focused_pane_id())
+            .foreground_window_title_target()
+            .or_else(|| self.default_shell_target())
+            .and_then(|target| {
+                self.app
+                    .state
+                    .workspaces
+                    .get(target.workspace_index)?
+                    .tabs
+                    .get(target.tab_index)
+            })
+            .map(|tab| tab.layout.focused())
             .is_some_and(|pane_id| sources.contains(&pane_id));
         let changes = self.app.sync_terminal_titles(sources);
         let outer_title_synced = focused_source && self.app.window_title_uses_terminal_title();
@@ -1509,12 +1515,28 @@ impl HeadlessServer {
         )
     }
 
-    /// Renders `ui.window_title` against current session state. `None` means
+    fn foreground_window_title_target(&self) -> Option<crate::ui::TabSurfaceTarget> {
+        self.foreground_client_id
+            .filter(|client_id| {
+                self.clients
+                    .get(client_id)
+                    .is_some_and(|client| client.is_active_shell_client())
+            })
+            .and_then(|client_id| self.shell_target_for_client(client_id))
+    }
+
+    /// Renders `ui.window_title` against the foreground client view. `None` means
     /// window titles are disabled or every token resolved empty, which leaves
     /// the client on Herdr's default title.
     fn configured_window_title(&self) -> Option<String> {
-        self.app
-            .window_title()
+        self.foreground_window_title_target()
+            .map_or_else(
+                || self.app.window_title(),
+                |target| {
+                    self.app
+                        .window_title_for(target.workspace_index, target.tab_index)
+                },
+            )
             .and_then(|title| crate::config::sanitize_window_title_text(&title))
     }
 
@@ -1968,6 +1990,8 @@ impl HeadlessServer {
                 endpoint_keybindings,
                 mouse_capture,
                 surface_active,
+                surface_reuse,
+                surface_delta,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -2013,6 +2037,8 @@ impl HeadlessServer {
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_mouse_capture = mouse_capture;
                 connection.shell_surface_active = surface_active;
+                connection.render_state.enable_surface_reuse(surface_reuse);
+                connection.render_state.enable_surface_delta(surface_delta);
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
@@ -2028,6 +2054,21 @@ impl HeadlessServer {
                 );
                 let location =
                     crate::server::clients::ClientShellLocation::from_snapshot(&seed_snapshot);
+                let agent_view = self.app.state.agent_view_override.clone();
+                let projection_message = match agent_view.as_ref() {
+                    Some(view) => match crate::protocol::endpoint::agent_view_projection_message(
+                        &seed_snapshot.boot_id,
+                        seed_snapshot.revision,
+                        Some(view),
+                    ) {
+                        Ok(message) => Some(message),
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode endpoint agent view");
+                            return false;
+                        }
+                    },
+                    None => None,
+                };
                 let snapshot_message =
                     match crate::protocol::endpoint::snapshot_message(&seed_snapshot) {
                         Ok(message) => message,
@@ -2038,9 +2079,13 @@ impl HeadlessServer {
                     };
                 connection.shell_location = Some(location);
                 connection.shell_snapshot = Some(seed_snapshot);
+                connection.shell_agent_view = agent_view;
                 self.clients.insert(client_id, connection);
                 if self.app.state.popup_pane.is_some() && self.popup_owner_tab_id.is_none() {
                     self.popup_owner_tab_id = self.shell_tab_id_for_client(client_id);
+                }
+                if let Some(message) = projection_message {
+                    self.send_to_client(client_id, message);
                 }
                 self.send_to_client(client_id, snapshot_message);
                 if surface_active {

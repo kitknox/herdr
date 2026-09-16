@@ -46,10 +46,7 @@ impl HeadlessServer {
                     let child_requests_mouse =
                         focused.is_some_and(|(runtime, _)| runtime.mouse_reporting_enabled());
                     let sgr_pixels = client.pixel_mouse
-                        && focused.is_some_and(|(runtime, pane_id)| {
-                            self.app.pane_graphics.active_for_pane(pane_id)
-                                && runtime.sgr_pixel_mouse_enabled()
-                        });
+                        && focused.is_some_and(|(runtime, _)| runtime.sgr_pixel_mouse_enabled());
                     Some((
                         client_id,
                         client.shell_surface_active
@@ -405,8 +402,73 @@ impl HeadlessServer {
             return;
         }
 
+        // Resize from the controlling client's geometry before drawing any observer.
+        // Retained updates fall back here when a pane changes alternate screens.
+        for (client_id, (cols, rows), cell_size, _, _) in &render_targets {
+            let Some(client) = self.clients.get(client_id) else {
+                continue;
+            };
+            if !client.is_active_shell_client() {
+                continue;
+            }
+            let Some(tab_id) = self.shell_tab_id_for_client(*client_id) else {
+                continue;
+            };
+            if self.tab_geometry_controllers.get(&tab_id) != Some(client_id) {
+                continue;
+            }
+            let changed = client
+                .render_state
+                .last_pane_surface()
+                .is_none_or(|surface| {
+                    surface.panes.iter().any(|pane| {
+                        let Some((workspace_index, pane_id)) =
+                            self.app.parse_pane_id(&pane.pane_id)
+                        else {
+                            return false;
+                        };
+                        self.app
+                            .state
+                            .runtime_for_pane_in_workspace(
+                                &self.app.terminal_runtimes,
+                                workspace_index,
+                                pane_id,
+                            )
+                            .is_some_and(|runtime| {
+                                runtime.alternate_screen_active() != pane.alternate_screen_active
+                            })
+                    })
+                });
+            if changed {
+                if let Some(target) = self.shell_target_for_client(*client_id) {
+                    crate::ui::resize_tab_surface(
+                        &self.app.state,
+                        &self.app.terminal_runtimes,
+                        target.workspace_index,
+                        target.tab_index,
+                        Rect::new(0, 0, *cols, *rows),
+                        if cell_size.is_known() {
+                            *cell_size
+                        } else {
+                            crate::kitty_graphics::HostCellSize::default()
+                        },
+                    );
+                }
+            }
+        }
+
         let mut broken_clients: Vec<u64> = Vec::new();
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
+            #[cfg(unix)]
+            if matches!(mode, ClientConnectionMode::TerminalObserve { .. })
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.deferred_render() != DeferredRender::None)
+            {
+                // The writer-drained event schedules recovery, even if pane output stops.
+                continue;
+            }
             let area = Rect::new(0, 0, cols, rows);
             let shell_target = self.shell_target_for_client(client_id);
             let shell_tab_id = self.shell_tab_id_for_client(client_id);
@@ -417,6 +479,7 @@ impl HeadlessServer {
                     .clients
                     .get(&client_id)
                     .and_then(|client| client.shell_location.clone());
+                let agent_view = self.app.state.agent_view_override.clone();
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     continue;
                 };
@@ -433,19 +496,52 @@ impl HeadlessServer {
                     self.server_config_diagnostic_without_keybindings.clone()
                 };
                 candidate.revision = client.shell_projection_revision;
-                if client.shell_snapshot.as_ref() != Some(&candidate) {
+                if client.shell_snapshot.as_ref() != Some(&candidate)
+                    || client.shell_agent_view != agent_view
+                {
                     client.shell_projection_revision =
                         client.shell_projection_revision.saturating_add(1);
                     candidate.revision = client.shell_projection_revision;
-                    let message = match crate::protocol::endpoint::snapshot_message(&candidate) {
-                        Ok(message) => message,
+                    let projection_message = if agent_view.is_some()
+                        || client.shell_agent_view.is_some()
+                    {
+                        match crate::protocol::endpoint::agent_view_projection_message(
+                            &candidate.boot_id,
+                            candidate.revision,
+                            agent_view.as_ref(),
+                        ) {
+                            Ok(message) => Some(message),
+                            Err(err) => {
+                                warn!(client_id, err = %err, "failed to encode endpoint agent view");
+                                broken_clients.push(client_id);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let snapshot_message =
+                        match crate::protocol::endpoint::snapshot_message(&candidate) {
+                            Ok(message) => message,
+                            Err(err) => {
+                                warn!(client_id, err = %err, "failed to encode endpoint snapshot");
+                                broken_clients.push(client_id);
+                                continue;
+                            }
+                        };
+                    let projection_framed = match projection_message
+                        .as_ref()
+                        .map(Self::frame_server_message)
+                        .transpose()
+                    {
+                        Ok(framed) => framed,
                         Err(err) => {
-                            warn!(client_id, err = %err, "failed to encode endpoint snapshot");
+                            warn!(client_id, err = %err, "failed to frame endpoint agent view");
                             broken_clients.push(client_id);
                             continue;
                         }
                     };
-                    let framed = match Self::frame_server_message(&message) {
+                    let snapshot_framed = match Self::frame_server_message(&snapshot_message) {
                         Ok(framed) => framed,
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to frame endpoint snapshot");
@@ -457,11 +553,14 @@ impl HeadlessServer {
                         broken_clients.push(client_id);
                         continue;
                     };
-                    if writer.control.send(framed).is_err() {
+                    if projection_framed.is_some_and(|framed| writer.control.send(framed).is_err())
+                        || writer.control.send(snapshot_framed).is_err()
+                    {
                         broken_clients.push(client_id);
                         continue;
                     }
                     client.shell_snapshot = Some(candidate);
+                    client.shell_agent_view = agent_view;
                 }
                 shell_projection_revision = client.shell_projection_revision;
                 if !client.shell_surface_active {

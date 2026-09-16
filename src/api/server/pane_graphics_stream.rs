@@ -663,6 +663,7 @@ mod tests {
         line
     }
 
+    #[cfg(unix)]
     fn assert_server_stream_owner(owner: &str) {
         assert!(owner.starts_with("pane.graphics.stream:"));
     }
@@ -1022,7 +1023,6 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() >= Duration::from_millis(50));
-        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

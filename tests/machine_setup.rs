@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -203,6 +203,59 @@ fn setup_with_strict_host_key_failure(
         prompts,
         success: status.success(),
     }
+}
+
+#[test]
+fn machine_add_accepts_help_argument_order() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "herdr-machine-add-order-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let app = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    fs::create_dir_all(root.join("config").join(app)).unwrap();
+    fs::write(
+        root.join("config").join(app).join("config.toml"),
+        "onboarding = false\n[remote]\nmanage_ssh_config = false\n",
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command.args(["machine", "add", "--label", "coder", "workstation.coder"]);
+    // Reach remote preparation, but never execute SSH or start a server.
+    command.env("PATH", root.join("no-executables"));
+    command.env("HOME", &root);
+    command.env("XDG_CONFIG_HOME", root.join("config"));
+    command.env("XDG_STATE_HOME", root.join("state"));
+    command.env("XDG_RUNTIME_DIR", &root);
+    for name in [
+        "HERDR_ENV",
+        "HERDR_SESSION",
+        "HERDR_SOCKET_PATH",
+        "HERDR_CLIENT_SOCKET_PATH",
+        "HERDR_REMOTE_BINARY",
+        "HERDR_CONFIG_PATH",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command.output().unwrap();
+    let saved = root
+        .join("state")
+        .join(app)
+        .join("client/endpoints.json")
+        .exists();
+    fs::remove_dir_all(root).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("machine was not saved"), "{stderr}");
+    assert!(!saved, "failed preparation must not save a machine");
 }
 
 #[test]

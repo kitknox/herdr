@@ -38,6 +38,7 @@ mod server_not_running;
 mod spec;
 mod status;
 mod tab;
+mod target;
 mod workspace;
 mod worktree;
 
@@ -92,6 +93,10 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
         print!("{text}");
     }
     Ok(0)
+}
+
+pub(crate) fn maybe_run_machine(args: &[String]) -> Option<std::io::Result<CommandOutcome>> {
+    target::maybe_run(args)
 }
 
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
@@ -764,7 +769,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 }
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
-    let client = ApiClient::local();
+    let client = target::api_client()?;
     ensure_server_protocol_compatible(&client, &request.id)?;
     client
         .request_value(request)
@@ -772,7 +777,7 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
-    let client = ApiClient::local();
+    let client = target::api_client()?;
     client
         .request_value(request)
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
@@ -785,11 +790,9 @@ fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> st
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
-    let Some(response) = protocol_guard::mismatch_response(
-        request_id,
-        server_protocol,
-        &crate::session::active_restart_after_update_guidance(),
-    ) else {
+    let Some(response) =
+        protocol_guard::mismatch_response(request_id, server_protocol, &target::restart_guidance())
+    else {
         return Ok(());
     };
 
@@ -836,6 +839,9 @@ fn map_server_not_running_or_io(
     request_id: &str,
     client: &ApiClient,
 ) -> std::io::Error {
+    if target::is_remote() {
+        return target::remote_error(api_client_error_to_io(err));
+    }
     match err {
         ApiClientError::Io(io_err) if server_not_running_error(&io_err) => {
             server_not_running::reported_error(server_not_running::response(
@@ -968,8 +974,11 @@ fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
 fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), i32> {
     let mut name = None;
     let mut json = false;
+    let mut options_ended = false;
     for arg in args {
-        if arg == "--json" {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg == "--json" {
             json = true;
         } else if name.is_none() {
             name = Some(arg.clone());
@@ -1087,6 +1096,16 @@ mod tests {
             super::channel_set_install_action(None),
             super::ChannelSetInstallAction::RunSelfUpdate
         );
+    }
+
+    #[test]
+    fn session_name_parser_accepts_option_terminator() {
+        for name in ["-h", "--json"] {
+            assert_eq!(
+                super::parse_session_name_and_json(&["--".to_string(), name.to_string()], "usage",),
+                Ok((name.to_string(), false))
+            );
+        }
     }
 
     #[test]

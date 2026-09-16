@@ -63,7 +63,7 @@ impl ClientShellState {
             remote_collapsed_groups,
         };
         if let Err(error) = preferences::store(path, preferences) {
-            self.endpoint_error = Some(error);
+            self.set_endpoint_error(error);
             outcome.repaint = true;
         }
     }
@@ -97,7 +97,7 @@ impl ClientShellState {
                         .config
                         .apply_snapshot_keybindings(profile.as_deref(), &commands)
                     {
-                        self.endpoint_error = Some(err);
+                        self.set_endpoint_error(err);
                     }
                 }
             }
@@ -476,7 +476,10 @@ mod tests {
         );
         assert_eq!(shell.agents.row_gap, 2);
         assert_eq!(
-            shell.agents.rows[0][0].style_for_value("Local").bold,
+            shell.agents.rows[0][0]
+                .style_for_value("Local")
+                .unwrap()
+                .bold,
             Some(true)
         );
         let previous = shell.agents.clone();

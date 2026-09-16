@@ -1,8 +1,17 @@
 diff --git a/vendor/libghostty-vt/src/terminal/formatter.zig b/vendor/libghostty-vt/src/terminal/formatter.zig
-index 553ea28d..5bc456ef 100644
 --- a/vendor/libghostty-vt/src/terminal/formatter.zig
 +++ b/vendor/libghostty-vt/src/terminal/formatter.zig
-@@ -1153,6 +1153,14 @@ pub const PageFormatter = struct {
+@@ -1302,6 +1308,9 @@ pub const PageFormatter = struct {
+                 if (cp_map_empty) fast: {
+                     if (comptime formatStyled(emit)) {
+                         if (style_id == invalid_style_id) break :fast;
++                        // Pending untouched cells need the default style before
++                        // a run can resume the preceding styled text.
++                        if (blank_cells > 0 and style_id != 0) break :fast;
+                     }
+
+                     const consumed = try self.writeCellRun(
+@@ -1361,6 +1370,15 @@ pub const PageFormatter = struct {
                  // This cell is not blank. If we have accumulated blank cells
                  // then we want to emit them now.
                  if (blank_cells > 0) {
@@ -10,14 +19,15 @@ index 553ea28d..5bc456ef 100644
 +                    // the preceding cell's style before writing the gap so
 +                    // its background and attributes don't bleed into it.
 +                    if (!style.default()) {
-+                        try self.formatStyleClose(writer);
++                        try self.formatStyleClose(emit, writer);
 +                        style = .{};
++                        style_id = 0;
 +                    }
 +
                      try writer.splatByteAll(' ', blank_cells);
 
-                     if (self.point_map) |*map| {
-@@ -3536,6 +3544,46 @@ test "Page VT multi-line with styles" {
+                     if (self.point_map) |*map| try self.appendBlankPoints(
+@@ -4107,6 +4125,87 @@ test "Page VT multi-line with styles" {
      try testing.expectEqual(output.len, point_map.items.len);
  }
 
@@ -25,7 +35,7 @@ index 553ea28d..5bc456ef 100644
 +    const testing = std.testing;
 +    const alloc = testing.allocator;
 +
-+    var t = try Terminal.init(alloc, .{ .cols = 40, .rows = 4 });
++    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
 +    defer t.deinit(alloc);
 +    var s = t.vtStream();
 +    defer s.deinit();
@@ -44,6 +54,47 @@ index 553ea28d..5bc456ef 100644
 +            .expected = "<div style=\"font-family: monospace; white-space: pre;\">" ++
 +                "<div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
 +                "BAR  </div>    RIGHT</div>",
++        },
++    };
++    for (cases) |case| {
++        var builder: std.Io.Writer.Allocating = .init(alloc);
++        defer builder.deinit();
++        var formatter: PageFormatter = .init(page, .{ .emit = case.emit });
++        var point_map: std.ArrayList(Coordinate) = .empty;
++        defer point_map.deinit(alloc);
++        formatter.point_map = .{ .alloc = alloc, .map = &point_map };
++
++        try formatter.format(&builder.writer);
++        const output = builder.writer.buffered();
++        try testing.expectEqualStrings(case.expected, output);
++        try testing.expectEqual(output.len, point_map.items.len);
++    }
++}
++
++test "Page styles resume after empty cell gaps before same-style runs" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
++    defer t.deinit(alloc);
++    var s = t.vtStream();
++    defer s.deinit();
++    s.nextSlice("\x1b[48;5;12mBAR  \x1b[0m\x1b[1;10H\x1b[48;5;12mRIGHT");
++
++    const page = t.screens.active.pages.pages.last.?.page();
++    const Case = struct { emit: Format, expected: []const u8 };
++    const cases = [_]Case{
++        .{ .emit = .plain, .expected = "BAR      RIGHT" },
++        .{
++            .emit = .vt,
++            .expected = "\x1b[0m\x1b[48;5;12mBAR  \x1b[0m    \x1b[0m\x1b[48;5;12mRIGHT\x1b[0m",
++        },
++        .{
++            .emit = .html,
++            .expected = "<div style=\"font-family: monospace; white-space: pre;\">" ++
++                "<div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
++                "BAR  </div>    <div style=\"display: inline;background-color: var(--vt-palette-12);\">" ++
++                "RIGHT</div></div>",
 +        },
 +    };
 +    for (cases) |case| {

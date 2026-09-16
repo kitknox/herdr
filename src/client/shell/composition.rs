@@ -40,35 +40,55 @@ impl ClientShellState {
                 .navigate_workspace_id
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
-        super::endpoint_sidebar::render_expanded(
-            &mut buffer,
-            sidebar,
-            self.snapshot.as_deref(),
-            &self.config,
-            &mut render::ShellRenderState {
-                endpoints: &self.endpoints,
-                active_endpoint_id: &self.active_endpoint_id,
-                collapsed_endpoints: &self.collapsed_endpoints,
-                collapsed_groups: &self.collapsed_groups,
-                remote_collapsed_groups: &self.remote_collapsed_groups,
-                workspace_scroll: &mut self.workspace_scroll,
-                agent_scroll: &mut self.agent_scroll,
-                tab_scroll: &mut self.tab_scroll,
-                reveal_focused_workspace: &mut self.reveal_focused_workspace,
-                reveal_focused_tab: &mut self.reveal_focused_tab,
-                sidebar_collapsed: false,
-                sidebar_section_split: self.sidebar_section_split,
-                tab_drag_insert_index: None,
-                selected_workspace_id: self
-                    .navigate_workspace_id
-                    .as_ref()
-                    .filter(|_| valid_navigation_target),
-                reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
-                dragged_workspace_id: None,
-                workspace_drop_indicator_row: None,
-            },
-            &mut self.hits,
-        );
+        // A resize invalidates pane geometry, not the healthy Local workspace chrome.
+        let local_snapshot = self.snapshot.as_deref().filter(|_| {
+            self.endpoints.len() == 1
+                && !self.sidebar_collapsed
+                && layout.sidebar.width > 0
+                && self.endpoint_status(&self.active_endpoint_id)
+                    == Some(ClientEndpointStatus::Online)
+        });
+        let mut render_state = render::ShellRenderState {
+            endpoints: &self.endpoints,
+            active_endpoint_id: &self.active_endpoint_id,
+            collapsed_endpoints: &self.collapsed_endpoints,
+            collapsed_groups: &self.collapsed_groups,
+            remote_collapsed_groups: &self.remote_collapsed_groups,
+            workspace_scroll: &mut self.workspace_scroll,
+            agent_scroll: &mut self.agent_scroll,
+            tab_scroll: &mut self.tab_scroll,
+            reveal_focused_workspace: &mut self.reveal_focused_workspace,
+            reveal_focused_tab: &mut self.reveal_focused_tab,
+            sidebar_collapsed: false,
+            sidebar_section_split: self.sidebar_section_split,
+            tab_drag_insert_index: None,
+            selected_workspace_id: self
+                .navigate_workspace_id
+                .as_ref()
+                .filter(|_| valid_navigation_target),
+            reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
+            dragged_workspace_id: None,
+            workspace_drop_indicator_row: None,
+        };
+        if let Some(snapshot) = local_snapshot {
+            render::render_sidebar(
+                &mut buffer,
+                sidebar,
+                snapshot,
+                &self.config,
+                &mut render_state,
+                &mut self.hits,
+            );
+        } else {
+            super::endpoint_sidebar::render_expanded(
+                &mut buffer,
+                sidebar,
+                self.snapshot.as_deref(),
+                &self.config,
+                &mut render_state,
+                &mut self.hits,
+            );
+        }
         if !self.config.mouse_capture {
             self.hits = ShellHitMap::default();
         }
@@ -87,14 +107,16 @@ impl ClientShellState {
         } else {
             Rect::new(0, 0, cols, 1)
         };
-        render::put_text(
-            &mut buffer,
-            message_area.x,
-            message_area.y,
-            message_area.width,
-            &message,
-            Style::default().fg(self.config.palette.overlay0),
-        );
+        if local_snapshot.is_none() || self.endpoint_error.is_some() {
+            render::put_text(
+                &mut buffer,
+                message_area.x,
+                message_area.y,
+                message_area.width,
+                &message,
+                Style::default().fg(self.config.palette.overlay0),
+            );
+        }
         render::render_mode_bar(
             &mut buffer,
             Rect::new(0, 0, cols, rows),
@@ -109,6 +131,8 @@ impl ClientShellState {
     }
 
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+        self.last_composed_at = Some(std::time::Instant::now());
+        self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
             self.reveal_navigation_workspace = true;
             self.reveal_mobile_workspace = true;
@@ -123,9 +147,11 @@ impl ClientShellState {
             return Some(self.compose_unavailable(cols, rows));
         }
         let snapshot = self.snapshot.as_deref()?;
-        // A one-step successor is retained separately until its exact snapshot arrives; do not
-        // keep composing the now-superseded current pair while it is pending.
-        if self.pending_pane_surface.is_some() {
+        // Do not compose a retained surface while waiting for its matching snapshot or
+        // connection generation.
+        if self.pending_pane_surface.is_some()
+            || self.pane_surface_generation != self.active_snapshot_generation
+        {
             return None;
         }
         let surface = self.pane_surface.as_ref()?;
@@ -290,6 +316,7 @@ impl ClientShellState {
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
+        let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
         let has_selection = self
             .selection
             .as_ref()
@@ -311,6 +338,7 @@ impl ClientShellState {
                         hit,
                         &self.config.palette,
                         false,
+                        &mut occlusion,
                     );
                 }
                 let selection_is_stale_copy_projection = !copy_surface_coherent
@@ -322,6 +350,13 @@ impl ClientShellState {
                                 .is_some_and(|selection| selection.pane_id == hit.pane_id)
                     });
                 if !selection_is_stale_copy_projection {
+                    if let Some(selection) =
+                        self.selection.as_ref().filter(|s| s.pane_id == hit.pane_id)
+                    {
+                        for rect in selection.visible_rects(hit.inner_rect, hit.scroll) {
+                            occlusion.cover(rect);
+                        }
+                    }
                     crate::ui::render_selection_highlight(
                         self.selection.as_ref(),
                         &mut composed,
@@ -329,7 +364,10 @@ impl ClientShellState {
                         hit.inner_rect,
                         hit.scroll,
                         &self.config.palette,
-                        crate::terminal_theme::TerminalTheme::default(),
+                        crate::terminal_theme::TerminalTheme {
+                            background: self.host_background,
+                            ..Default::default()
+                        },
                     );
                 }
                 if copy_surface_coherent {
@@ -339,11 +377,13 @@ impl ClientShellState {
                         hit,
                         &self.config.palette,
                         true,
+                        &mut occlusion,
                     );
                 }
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
+        self.render_link_hover(&mut frame, &mut occlusion);
         if self.mode == ClientShellMode::Copy {
             frame.cursor = None;
             if let Some(copy_mode) = self.copy_mode.as_ref() {
@@ -356,12 +396,15 @@ impl ClientShellState {
                         .saturating_sub(copy_mode.offset_from_bottom)
                         .min(u32::MAX as usize) as u32;
                     let viewport_row = copy_mode.cursor.row.saturating_sub(viewport_top);
+                    let x = hit.inner_rect.x.saturating_add(copy_mode.cursor.col);
+                    let y = hit.inner_rect.y.saturating_add(viewport_row as u16);
                     if viewport_row < u32::from(hit.inner_rect.height)
                         && copy_mode.cursor.col < hit.inner_rect.width
+                        && x < frame.width
+                        && y < frame.height
                     {
                         let mut composed = frame.to_ratatui_buffer()?;
-                        let x = hit.inner_rect.x + copy_mode.cursor.col;
-                        let y = hit.inner_rect.y + viewport_row as u16;
+                        occlusion.cover(Rect::new(x, y, 1, 1));
                         composed[(x, y)].set_style(
                             Style::default()
                                 .fg(match self.config.palette.panel_bg {
@@ -405,17 +448,18 @@ impl ClientShellState {
                     diagnostic_area,
                     diagnostic,
                     &self.config.palette,
+                    |rect| occlusion.cover(rect),
                 );
             }
             let lifecycle_offset = active_lifecycle.as_ref().map_or(0, |(label, status)| {
-                let _ = endpoint_notices::render_lifecycle_banner(
+                occlusion.cover(endpoint_notices::render_lifecycle_banner(
                     &mut composed,
                     Rect::new(0, 0, cols, rows),
                     label,
                     *status,
                     u16::from(has_config_diagnostic) + layout.mobile_header.height,
                     &self.config.palette,
-                );
+                ));
                 1
             });
             if let Some(notice) = self.visible_endpoint_notice.as_ref() {
@@ -456,6 +500,7 @@ impl ClientShellState {
                     )
                 };
             }
+            occlusion.cover(self.hits.notification_toast);
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         if let Some(feedback) = self.copy_feedback.as_ref() {
@@ -474,14 +519,14 @@ impl ClientShellState {
                 self.config.clipboard_toast_position,
                 self.hits.notification_toast,
             );
-            crate::ui::render_copy_feedback_buffer(
+            occlusion.cover(crate::ui::render_copy_feedback_buffer(
                 &mut composed,
                 feedback_area,
                 feedback,
                 offset,
                 self.config.clipboard_toast_position,
                 &self.config.palette,
-            );
+            ));
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         self.hits.popup = None;
@@ -491,6 +536,7 @@ impl ClientShellState {
             if let Some(geometry) =
                 crate::popup_size::resolve_popup_geometry(width, height, layout.pane_surface)
             {
+                occlusion.start_popup(geometry.outer);
                 let mut composed = frame.to_ratatui_buffer()?;
                 let block = ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
@@ -524,6 +570,7 @@ impl ClientShellState {
             && self.overlay.is_none()
         {
             let mut composed = frame.to_ratatui_buffer()?;
+            occlusion.cover(composed.area);
             super::mobile::render_mobile_switcher(
                 &mut composed,
                 Rect::new(0, 0, cols, rows),
@@ -563,20 +610,27 @@ impl ClientShellState {
             self.hits.popup = None;
         }
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
+        if let Some(bar) = mode_bar {
+            occlusion.cover(bar);
+        }
         if let Some(overlay) = self.overlay.as_ref() {
             let mut composed = frame.to_ratatui_buffer()?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
-                self.hits.context_menu_rows =
+                let rendered =
                     render::render_context_menu(&mut composed, menu, &self.config.palette)?;
+                occlusion.cover(rendered.area);
+                self.hits.context_menu_rows = rendered.menu_rows;
                 None
             } else if let ClientShellOverlay::GlobalMenu(menu) = overlay {
-                self.hits.global_menu_rows = render::render_global_menu(
+                let rendered = render::render_global_menu(
                     &mut composed,
                     self.hits.global_launcher,
                     menu,
                     snapshot,
                     &self.config.palette,
                 )?;
+                occlusion.cover(rendered.area);
+                self.hits.global_menu_rows = rendered.menu_rows;
                 None
             } else {
                 let rendered = render::render_client_overlay(
@@ -588,6 +642,7 @@ impl ClientShellState {
                     &self.config.keybinds,
                     &self.config.palette,
                 )?;
+                occlusion.cover(rendered.area);
                 self.hits.overlay_primary = rendered.primary;
                 self.hits.overlay_clear = rendered.clear;
                 self.hits.overlay_cancel = rendered.cancel;
@@ -634,7 +689,7 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
-        self.compose_graphics(&mut frame, layout);
+        self.compose_graphics(&mut frame, layout, &occlusion);
         Some(frame)
     }
 }
@@ -657,6 +712,7 @@ fn render_client_copy_search_highlights(
     hit: &PaneHit,
     palette: &Palette,
     current_only: bool,
+    occlusion: &mut crate::kitty_graphics::surface::Occlusion,
 ) {
     let Some(copy_mode) = copy_mode.filter(|copy_mode| copy_mode.pane_id == hit.pane_id) else {
         return;
@@ -698,7 +754,14 @@ fn render_client_copy_search_highlights(
             } else {
                 hit.inner_rect.width.saturating_sub(1)
             };
-            for col in start_col..=end_col.min(hit.inner_rect.width.saturating_sub(1)) {
+            let end_col = end_col.min(hit.inner_rect.width.saturating_sub(1));
+            occlusion.cover(Rect::new(
+                hit.inner_rect.x.saturating_add(start_col),
+                hit.inner_rect.y.saturating_add(viewport_row),
+                end_col.saturating_add(1).saturating_sub(start_col),
+                1,
+            ));
+            for col in start_col..=end_col {
                 buffer[(
                     hit.inner_rect.x.saturating_add(col),
                     hit.inner_rect.y.saturating_add(viewport_row),
