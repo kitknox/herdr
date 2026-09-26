@@ -798,6 +798,7 @@ fn event_envelope_round_trips() {
                     },
                     focused_pane_id: "w_1-1".into(),
                     panes: vec![PaneLayoutPane {
+                        terminal_size: None,
                         pane_id: "w_1-1".into(),
                         focused: true,
                         rect: PaneLayoutRect {

@@ -2029,6 +2029,7 @@ impl App {
         .into_iter()
         .filter_map(|pane| {
             Some(PaneLayoutPane {
+                terminal_size: None,
                 pane_id: self.public_pane_id(ws_idx, pane.id)?,
                 focused: pane.is_focused,
                 rect: pane.rect.into(),
@@ -2118,6 +2119,7 @@ impl App {
             .iter()
             .filter_map(|info| {
                 Some(PaneLayoutPane {
+                    terminal_size: None,
                     pane_id: self.public_pane_id(ws_idx, info.id)?,
                     focused: info.is_focused,
                     rect: info.inner_rect.into(),

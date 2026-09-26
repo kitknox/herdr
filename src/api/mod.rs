@@ -88,6 +88,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PluginPaneFocus(_)
             | Method::PluginPaneClose(_)
             | Method::TabSetGeometry(_)
+            | Method::TabSetPaneGeometry(_)
             | Method::TabClaimGeometry(_)
     )
 }

@@ -284,6 +284,8 @@ pub enum Method {
     TerminalResize(TerminalResizeParams),
     #[serde(rename = "tab.set_geometry")]
     TabSetGeometry(TabSetGeometryParams),
+    #[serde(rename = "tab.set_pane_geometry")]
+    TabSetPaneGeometry(TabSetPaneGeometryParams),
     #[serde(rename = "tab.claim_geometry")]
     TabClaimGeometry(TabClaimGeometryParams),
     #[serde(rename = "control.list")]

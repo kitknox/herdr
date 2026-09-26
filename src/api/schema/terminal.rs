@@ -183,6 +183,22 @@ pub struct TabSetGeometryParams {
     pub claim: bool,
 }
 
+/// Independent terminal grids, negotiated separately from tab layout coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TabSetPaneGeometryParams {
+    #[serde(flatten)]
+    pub geometry: TabSetGeometryParams,
+    pub panes: std::collections::BTreeMap<String, PaneTerminalSize>,
+}
+
 fn default_true() -> bool {
     true
 }

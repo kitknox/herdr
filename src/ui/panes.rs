@@ -282,11 +282,21 @@ pub(super) fn resize_tab_panes(
             let pane_inner = pane_inner_rect(area, borders);
             let inner_rect = terminal_inner_rect(rt, pane_inner, chrome.scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
+                let size = app
+                    .control_pane_geometry
+                    .get(&focused_id)
+                    .copied()
+                    .unwrap_or(crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    });
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -306,11 +316,19 @@ pub(super) fn resize_tab_panes(
         {
             let inner_rect = terminal_inner_rect(rt, pane_inner, chrome.scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
+                let size = app.control_pane_geometry.get(&info.id).copied().unwrap_or(
+                    crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    },
+                );
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -356,11 +374,21 @@ pub(super) fn compute_pane_infos_for_tab(
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
             {
+                let size = app
+                    .control_pane_geometry
+                    .get(&focused_id)
+                    .copied()
+                    .unwrap_or(crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    });
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }
@@ -394,11 +422,19 @@ pub(super) fn compute_pane_infos_for_tab(
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
             {
+                let size = app.control_pane_geometry.get(&info.id).copied().unwrap_or(
+                    crate::api::schema::PaneTerminalSize {
+                        cols: inner_rect.width,
+                        rows: inner_rect.height,
+                        cell_width_px: cell_size.width_px,
+                        cell_height_px: cell_size.height_px,
+                    },
+                );
                 rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+                    size.rows,
+                    size.cols,
+                    size.cell_width_px,
+                    size.cell_height_px,
                 );
             }
         }

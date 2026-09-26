@@ -454,13 +454,13 @@ async fn control_open_negotiates_protocol_and_advertises_features() {
     )
     .expect("open response");
     assert_eq!(
-        opened["result"]["control_protocol"], 2,
+        opened["result"]["control_protocol"], 3,
         "negotiates down to what the server supports"
     );
-    assert_eq!(eager.protocol(), 2);
+    assert_eq!(eager.protocol(), 3);
     assert_eq!(
         opened["result"]["capabilities"]["terminal_control_stream"],
-        2
+        3
     );
     let features = opened["result"]["capabilities"]["control_features"]
         .as_array()
@@ -1550,4 +1550,265 @@ async fn auto_input_only_from_the_authority() {
         app_thread.join().expect("app thread"),
         "typing dispatches the claim"
     );
+}
+
+#[tokio::test]
+async fn independent_pane_geometry_preserves_shared_viewers_and_handoffs() {
+    use crate::api::schema::{PaneTerminalSize, TabSetPaneGeometryParams};
+    use ratatui::layout::Direction;
+    let mut server = test_headless_server();
+    let mut ws = crate::workspace::Workspace::test_new("independent-fonts");
+    let left = ws.tabs[0].root_pane;
+    let upper = ws.test_split(Direction::Horizontal);
+    let lower = ws.test_split(Direction::Vertical);
+    let mut inputs = Vec::new();
+    for pane in [left, upper, lower] {
+        let (runtime, input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"shared output",
+                4,
+            );
+        ws.insert_test_runtime(pane, runtime);
+        inputs.push(input);
+    }
+    server.app.state.workspaces = vec![ws];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let tab = server.app.public_tab_id(0, 0).unwrap();
+    let ids: Vec<_> = [left, upper, lower]
+        .into_iter()
+        .map(|pane| server.app.public_pane_id(0, pane).unwrap())
+        .collect();
+    let open_v3 = |server: &mut HeadlessServer, name: &str| {
+        open_control_with(
+            server,
+            ControlOpenParams {
+                client: Some(ControlClientInfo {
+                    name: name.into(),
+                    version: "test".into(),
+                    protocol: 3,
+                }),
+            },
+        )
+    };
+    let (a, a_rx, a_id) = open_v3(&mut server, "owner");
+    let (b, b_rx, b_id) = open_v3(&mut server, "viewer");
+    let (old, old_rx, _) = open_control_v2(&mut server, "older-viewer");
+    for (handle, rx) in [(&a, &a_rx), (&b, &b_rx), (&old, &old_rx)] {
+        for pane in &ids {
+            attach(&mut server, handle, rx, attach_params(pane));
+            drain(rx);
+        }
+    }
+    let sizes: std::collections::BTreeMap<_, _> = ids
+        .iter()
+        .cloned()
+        .zip([
+            PaneTerminalSize {
+                cols: 60,
+                rows: 30,
+                cell_width_px: 12,
+                cell_height_px: 24,
+            },
+            PaneTerminalSize {
+                cols: 80,
+                rows: 20,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+            PaneTerminalSize {
+                cols: 80,
+                rows: 10,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+        ])
+        .collect();
+    let response = send_control(
+        &mut server,
+        &a,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, true),
+            panes: sizes.clone(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["type"], "ok", "{response}");
+    assert_eq!(server.tab_geometry_controllers.get(&tab), Some(&a_id));
+    for (pane, id) in [left, upper, lower].into_iter().zip(&ids) {
+        let size = sizes[id];
+        assert_eq!(
+            server.app.state.workspaces[0].test_runtimes[&pane].current_size(),
+            (size.rows, size.cols)
+        );
+    }
+    let current = drain(&b_rx);
+    let layout = &records_of(&current, "tab.layout").last().unwrap()["layout"];
+    assert_eq!(layout["area"]["width"], 120);
+    assert!(layout["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|pane| pane["terminal_size"].is_object()));
+    assert!(!current
+        .iter()
+        .any(|record| record["type"] == "terminal.detached"));
+    let legacy = drain(&old_rx);
+    let projected = &records_of(&legacy, "tab.layout").last().unwrap()["layout"];
+    assert_eq!(projected["area"]["width"], 140);
+    assert_eq!(projected["area"]["height"], 30);
+    for pane in projected["panes"].as_array().unwrap() {
+        let size = sizes[pane["pane_id"].as_str().unwrap()];
+        assert_eq!(pane["rect"]["width"], size.cols);
+        assert_eq!(pane["rect"]["height"], size.rows);
+        assert!(pane.get("terminal_size").is_none());
+    }
+    let snapshot = send_control(
+        &mut server,
+        &old,
+        Method::SessionSnapshot(Default::default()),
+    )
+    .unwrap();
+    assert_eq!(&snapshot["result"]["snapshot"]["layouts"][0], projected);
+    assert!(server.app.state.direct_attach_resize_locks.is_empty());
+    let list = send_control(&mut server, &a, Method::ControlList(Default::default())).unwrap();
+    assert!(list["result"]["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|connection| connection["attaches"].as_array().unwrap().len() == 3));
+
+    // Rejected requests must not change the current owner's stored grids.
+    let unsupported = send_control(
+        &mut server,
+        &old,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, true),
+            panes: sizes.clone(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(unsupported["error"]["code"], "unsupported_protocol");
+    let mut invalid = sizes.clone();
+    invalid.get_mut(&ids[0]).unwrap().rows = 0;
+    let rejected = send_control(
+        &mut server,
+        &a,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, true),
+            panes: invalid,
+        }),
+    )
+    .unwrap();
+    assert_eq!(rejected["error"]["code"], "invalid_request");
+    let rejected = send_control(
+        &mut server,
+        &a,
+        Method::TabSetGeometry(geometry_params(&tab, 0, 40, true)),
+    )
+    .unwrap();
+    assert_eq!(rejected["error"]["code"], "invalid_request");
+    assert_eq!(server.app.state.control_pane_geometry[&left].rows, 30);
+
+    let mut other_sizes = sizes.clone();
+    other_sizes.get_mut(&ids[0]).unwrap().rows = 25;
+    send_control(
+        &mut server,
+        &b,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, false),
+            panes: other_sizes,
+        }),
+    );
+    assert_eq!(
+        server.tab_geometry_controllers.get(&tab),
+        Some(&a_id),
+        "storing viewer geometry must not claim"
+    );
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (30, 60)
+    );
+    claim_tab_geometry(
+        &mut server,
+        &b,
+        TabClaimGeometryParams {
+            tab_id: Some(tab.clone()),
+            attach_id: None,
+        },
+    );
+    assert_eq!(server.tab_geometry_controllers.get(&tab), Some(&b_id));
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (25, 60)
+    );
+    // A legacy viewer can still claim using the original uniform-grid method.
+    set_tab_geometry(&mut server, &old, &tab, 120, 40);
+    assert!(server.app.state.control_pane_geometry.is_empty());
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (40, 60)
+    );
+    let list = send_control(&mut server, &a, Method::ControlList(Default::default())).unwrap();
+    assert!(list["result"]["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|connection| connection["attaches"].as_array().unwrap().len() == 3));
+    // Native zoom only changes the visible terminal; unzoom restores all
+    // independent grids, without converting any attachment to exclusive mode.
+    server.app.state.workspaces[0].tabs[0].zoomed = true;
+    let zoom_size = PaneTerminalSize {
+        cols: 100,
+        rows: 50,
+        cell_width_px: 8,
+        cell_height_px: 16,
+    };
+    send_control(
+        &mut server,
+        &a,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 60, true),
+            panes: [(ids[2].clone(), zoom_size)].into_iter().collect(),
+        }),
+    );
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&lower].current_size(),
+        (50, 100)
+    );
+    let zoom_records = drain(&old_rx);
+    let zoom_layout = &records_of(&zoom_records, "tab.layout").last().unwrap()["layout"];
+    assert_eq!(zoom_layout["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(zoom_layout["area"]["width"], 100);
+    assert_eq!(zoom_layout["area"]["height"], 50);
+    server.app.state.workspaces[0].tabs[0].zoomed = false;
+    send_control(
+        &mut server,
+        &a,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, true),
+            panes: sizes,
+        }),
+    );
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (30, 60)
+    );
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&lower].current_size(),
+        (10, 80)
+    );
+    // A departing owner hands off to the most recently active surviving
+    // viewer, which here is the legacy client that last claimed the tab.
+    close_control(&mut server, &a);
+    assert!(server.app.state.control_pane_geometry.is_empty());
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (40, 60)
+    );
+    drop(inputs);
 }

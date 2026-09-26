@@ -69,6 +69,8 @@ pub(super) struct ControlConnectionState {
     handle: ControlConnectionHandle,
     attaches: HashMap<String, ControlAttach>,
     tab_geometry: HashMap<String, ControlTabGeometry>,
+    tab_pane_geometry:
+        HashMap<String, std::collections::BTreeMap<String, api::schema::PaneTerminalSize>>,
     next_attach: u64,
     client: Option<ControlClientInfo>,
     /// Negotiated control stream protocol, 1 for clients that sent none.
@@ -151,7 +153,10 @@ impl HeadlessServer {
                 "terminal.input is only available on a control stream".into(),
             ),
             Method::TabSetGeometry(params) => {
-                self.control_tab_set_geometry(id, msg.control.as_ref(), params)
+                self.control_tab_set_geometry(id, msg.control.as_ref(), params, None)
+            }
+            Method::TabSetPaneGeometry(params) => {
+                self.control_tab_set_pane_geometry(id, msg.control.as_ref(), params)
             }
             Method::TabClaimGeometry(params) => {
                 self.control_tab_claim_geometry(id, msg.control.as_ref(), params)
@@ -159,19 +164,29 @@ impl HeadlessServer {
             // A stream bootstraps from the same rectangles its `tab.layout`
             // records carry, not the TUI's view area.
             Method::SessionSnapshot(_) if msg.control.as_ref().is_some_and(|h| h.id() != 0) => {
-                self.control_session_snapshot(id)
+                self.control_session_snapshot(id, msg.control.as_ref())
             }
             _ => return None,
         };
         Some(response)
     }
 
-    fn control_session_snapshot(&self, id: String) -> String {
+    fn control_session_snapshot(
+        &self,
+        id: String,
+        handle: Option<&ControlConnectionHandle>,
+    ) -> String {
+        let protocol = handle
+            .and_then(|h| self.control_connections.get(&h.id()))
+            .map_or(1, |s| s.protocol);
         let mut snapshot = self.app.session_snapshot();
         snapshot.layouts = self
             .all_tab_targets()
             .into_iter()
-            .filter_map(|target| self.control_tab_layout(target, self.current_tab_area(target)))
+            .filter_map(|target| {
+                self.control_tab_layout(target, self.current_tab_area(target))
+                    .map(|layout| self.layout_for_control_protocol(layout, protocol))
+            })
             .collect();
         success(
             id,
@@ -216,11 +231,33 @@ impl HeadlessServer {
             false,
             crate::kitty_graphics::HostCellSize::default(),
         );
-        self.app.control_tab_layout_snapshot(
+        let mut layout = self.app.control_tab_layout_snapshot(
             target.workspace_index,
             target.tab_index,
             area,
             &surface.pane_infos,
+        )?;
+        for (pane, info) in layout.panes.iter_mut().zip(&surface.pane_infos) {
+            pane.terminal_size = self.app.state.control_pane_geometry.get(&info.id).copied();
+        }
+        Some(layout)
+    }
+
+    fn layout_for_control_protocol(
+        &self,
+        layout: api::schema::PaneLayoutSnapshot,
+        protocol: u32,
+    ) -> api::schema::PaneLayoutSnapshot {
+        if protocol >= 3 {
+            return layout;
+        }
+        let Some((ws, tab)) = self.app.parse_tab_id(&layout.tab_id) else {
+            return layout;
+        };
+        super::control_geometry::legacy_layout(
+            layout,
+            self.app.state.workspaces[ws].tabs[tab].layout.root(),
+            |pane| self.app.public_pane_id(ws, pane),
         )
     }
 
@@ -275,6 +312,7 @@ impl HeadlessServer {
                 handle: handle.clone(),
                 attaches: HashMap::new(),
                 tab_geometry: HashMap::new(),
+                tab_pane_geometry: HashMap::new(),
                 next_attach: 0,
                 client: client.clone(),
                 protocol,
@@ -964,11 +1002,81 @@ impl HeadlessServer {
         success(id, ResponseResult::Ok {})
     }
 
+    fn control_tab_set_pane_geometry(
+        &mut self,
+        id: String,
+        handle: Option<&ControlConnectionHandle>,
+        params: &api::schema::TabSetPaneGeometryParams,
+    ) -> String {
+        let connection_id = match self.control_connection_id(handle) {
+            Ok(value) => value,
+            Err(message) => return error(id, "control_stream_required", message),
+        };
+        if self
+            .control_connections
+            .get(&connection_id)
+            .is_none_or(|state| state.protocol < 3)
+        {
+            return error(
+                id,
+                "unsupported_protocol",
+                "pane geometry requires control protocol 3".into(),
+            );
+        }
+        let Some((ws, tab)) = self.app.parse_tab_id(&params.geometry.tab_id) else {
+            return error(id, "not_found", "tab not found".into());
+        };
+        let pane_ids: HashSet<_> = self.app.state.workspaces[ws].tabs[tab]
+            .layout
+            .pane_ids()
+            .into_iter()
+            .collect();
+        // Validate the whole request before changing either stored geometry.
+        if params.geometry.cols == 0
+            || params.geometry.rows == 0
+            || params.geometry.chrome != TabChrome::None
+            || params.panes.is_empty()
+            || params
+                .panes
+                .values()
+                .map(|s| u64::from(s.cols))
+                .sum::<u64>()
+                > u64::from(u16::MAX)
+            || params
+                .panes
+                .values()
+                .map(|s| u64::from(s.rows))
+                .sum::<u64>()
+                > u64::from(u16::MAX)
+            || params.panes.values().any(|size| {
+                size.cols == 0
+                    || size.rows == 0
+                    || size.cell_width_px == 0
+                    || size.cell_height_px == 0
+                    || size.cell_width_px > u32::from(u16::MAX)
+                    || size.cell_height_px > u32::from(u16::MAX)
+            })
+            || params.panes.keys().any(|pane| {
+                self.app
+                    .parse_pane_id(pane)
+                    .is_none_or(|(pane_ws, pane_id)| pane_ws != ws || !pane_ids.contains(&pane_id))
+            })
+        {
+            return error(
+                id,
+                "invalid_request",
+                "pane geometry requires nonzero sizes for panes in a chromeless tab".into(),
+            );
+        }
+        self.control_tab_set_geometry(id, handle, &params.geometry, Some(&params.panes))
+    }
+
     fn control_tab_set_geometry(
         &mut self,
         id: String,
         handle: Option<&ControlConnectionHandle>,
         params: &TabSetGeometryParams,
+        pane_sizes: Option<&std::collections::BTreeMap<String, api::schema::PaneTerminalSize>>,
     ) -> String {
         let connection_id = match self.control_connection_id(handle) {
             Ok(connection_id) => connection_id,
@@ -997,6 +1105,13 @@ impl HeadlessServer {
                 "control stream is not open".into(),
             );
         };
+        if let Some(sizes) = pane_sizes {
+            state
+                .tab_pane_geometry
+                .insert(params.tab_id.clone(), sizes.clone());
+        } else {
+            state.tab_pane_geometry.remove(&params.tab_id);
+        }
         let geometry =
             state
                 .tab_geometry
@@ -1132,6 +1247,7 @@ impl HeadlessServer {
     pub(super) fn prune_control_tab_geometry(&mut self, keep: impl Fn(&str) -> bool) {
         for state in self.control_connections.values_mut() {
             state.tab_geometry.retain(|tab_id, _| keep(tab_id));
+            state.tab_pane_geometry.retain(|tab_id, _| keep(tab_id));
         }
     }
 
@@ -1238,12 +1354,31 @@ impl HeadlessServer {
         let Some(layout) = self.control_tab_layout(target, area) else {
             return;
         };
-        let Ok(line) = serde_json::to_string(&api::schema::ControlRecord::TabLayout { layout })
-        else {
-            return;
+        // Serialize once per protocol, not once per attached viewer.
+        let current = serde_json::to_string(&api::schema::ControlRecord::TabLayout {
+            layout: layout.clone(),
+        })
+        .ok();
+        let legacy = if self
+            .control_connections
+            .values()
+            .any(|state| state.protocol < 3)
+        {
+            serde_json::to_string(&api::schema::ControlRecord::TabLayout {
+                layout: self.layout_for_control_protocol(layout, 2),
+            })
+            .ok()
+        } else {
+            None
         };
         for state in self.control_connections.values() {
-            state.handle.send_line(line.clone());
+            if let Some(line) = if state.protocol >= 3 {
+                &current
+            } else {
+                &legacy
+            } {
+                state.handle.send_line(line.clone());
+            }
         }
     }
 
@@ -1302,6 +1437,32 @@ impl HeadlessServer {
             };
             controllers.insert(tab_id.clone(), info);
         }
+        let mut pane_geometry = HashMap::new();
+        for (tab_id, controller) in &self.tab_geometry_controllers {
+            let Some(sizes) = self
+                .control_connections
+                .get(controller)
+                .and_then(|state| state.tab_pane_geometry.get(tab_id))
+            else {
+                continue;
+            };
+            let Some((ws, tab)) = self.app.parse_tab_id(tab_id) else {
+                continue;
+            };
+            let panes: HashSet<_> = self.app.state.workspaces[ws].tabs[tab]
+                .layout
+                .pane_ids()
+                .into_iter()
+                .collect();
+            for (public_id, size) in sizes {
+                if let Some((pane_ws, pane_id)) = self.app.parse_pane_id(public_id) {
+                    if pane_ws == ws && panes.contains(&pane_id) {
+                        pane_geometry.insert(pane_id, *size);
+                    }
+                }
+            }
+        }
+        self.app.state.control_pane_geometry = pane_geometry;
         self.app.state.control_chromeless_tabs = chromeless;
 
         let previous = std::mem::replace(

@@ -717,6 +717,9 @@ pub struct PaneLayoutPane {
     pub pane_id: String,
     pub focused: bool,
     pub rect: PaneLayoutRect,
+    /// Actual terminal grid, when it differs from the tab's layout units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<super::terminal::PaneTerminalSize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

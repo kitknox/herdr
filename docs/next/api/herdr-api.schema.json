@@ -59,6 +59,17 @@
             },
             "rect": {
               "$ref": "#/schemas/control_record/$defs/PaneLayoutRect"
+            },
+            "terminal_size": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/control_record/$defs/PaneTerminalSize"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual terminal grid, when it differs from the tab's layout units."
             }
           },
           "required": [
@@ -201,6 +212,40 @@
             "offset_from_bottom",
             "max_offset_from_bottom",
             "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PaneTerminalSize": {
+          "description": "Independent terminal grids, negotiated separately from tab layout coordinates.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cols",
+            "rows",
+            "cell_width_px",
+            "cell_height_px"
           ],
           "type": "object"
         },
@@ -1560,6 +1605,17 @@
             },
             "rect": {
               "$ref": "#/schemas/event/$defs/PaneLayoutRect"
+            },
+            "terminal_size": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneTerminalSize"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual terminal grid, when it differs from the tab's layout units."
             }
           },
           "required": [
@@ -1702,6 +1758,40 @@
             "offset_from_bottom",
             "max_offset_from_bottom",
             "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PaneTerminalSize": {
+          "description": "Independent terminal grids, negotiated separately from tab layout coordinates.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cols",
+            "rows",
+            "cell_width_px",
+            "cell_height_px"
           ],
           "type": "object"
         },
@@ -4119,6 +4209,40 @@
           ],
           "type": "object"
         },
+        "PaneTerminalSize": {
+          "description": "Independent terminal grids, negotiated separately from tab layout coordinates.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cols",
+            "rows",
+            "cell_width_px",
+            "cell_height_px"
+          ],
+          "type": "object"
+        },
         "PaneTextPoint": {
           "properties": {
             "col": {
@@ -5236,6 +5360,60 @@
             "tab_id",
             "cols",
             "rows"
+          ],
+          "type": "object"
+        },
+        "TabSetPaneGeometryParams": {
+          "properties": {
+            "cell_height_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "chrome": {
+              "$ref": "#/schemas/request/$defs/TabChrome",
+              "default": "server",
+              "description": "Whether Herdr lays the tab out with its own borders, gaps, and\nscrollbar gutters, or hands the client bare pane rectangles."
+            },
+            "claim": {
+              "default": true,
+              "description": "Take the tab's geometry now (the default). With `false` the size is\nonly stored, for a later `tab.claim_geometry` or input-driven claim.",
+              "type": "boolean"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "panes": {
+              "additionalProperties": {
+                "$ref": "#/schemas/request/$defs/PaneTerminalSize"
+              },
+              "type": "object"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "cols",
+            "rows",
+            "panes"
           ],
           "type": "object"
         },
@@ -7527,6 +7705,22 @@
         {
           "properties": {
             "method": {
+              "const": "tab.set_pane_geometry",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabSetPaneGeometryParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "tab.claim_geometry",
               "type": "string"
             },
@@ -9454,6 +9648,17 @@
             },
             "rect": {
               "$ref": "#/schemas/success_response/$defs/PaneLayoutRect"
+            },
+            "terminal_size": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneTerminalSize"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Actual terminal grid, when it differs from the tab's layout units."
             }
           },
           "required": [
@@ -9955,6 +10160,40 @@
             "source_pane_id",
             "focused_pane_id",
             "layout"
+          ],
+          "type": "object"
+        },
+        "PaneTerminalSize": {
+          "description": "Independent terminal grids, negotiated separately from tab layout coordinates.",
+          "properties": {
+            "cell_height_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cell_width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cols",
+            "rows",
+            "cell_width_px",
+            "cell_height_px"
           ],
           "type": "object"
         },

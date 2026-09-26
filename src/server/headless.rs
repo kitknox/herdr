@@ -73,6 +73,7 @@ use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod bootstrap;
 mod client_views;
+mod control_geometry;
 mod control_stream;
 mod endpoint_requests;
 mod lifecycle;
