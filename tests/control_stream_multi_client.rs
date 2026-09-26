@@ -310,7 +310,7 @@ fn control_streams_share_a_pane_and_geometry_follows_the_last_interaction() {
     let mut a = ControlStream::open(&api, Some("a"));
     let mut b = ControlStream::open(&api, Some("b"));
     assert_eq!(a.control_protocol, 2);
-    assert_eq!(a.capabilities["terminal_control_stream"], 2);
+    assert_eq!(a.capabilities["terminal_control_stream"], 3);
     assert!(a.capabilities["control_features"]
         .as_array()
         .unwrap()

@@ -1049,8 +1049,10 @@ impl HeadlessServer {
                 .sum::<u64>()
                 > u64::from(u16::MAX)
             || params.panes.values().any(|size| {
-                size.cols == 0
-                    || size.rows == 0
+                // PaneRuntime::resize clamps to 4x2. Reject smaller grids
+                // before storing them or publishing a mismatched tab.layout.
+                size.cols < 4
+                    || size.rows < 2
                     || size.cell_width_px == 0
                     || size.cell_height_px == 0
                     || size.cell_width_px > u32::from(u16::MAX)
@@ -1065,7 +1067,7 @@ impl HeadlessServer {
             return error(
                 id,
                 "invalid_request",
-                "pane geometry requires nonzero sizes for panes in a chromeless tab".into(),
+                "pane geometry requires grids of at least 4 columns and 2 rows, with nonzero cell metrics, in a chromeless tab".into(),
             );
         }
         self.control_tab_set_geometry(id, handle, &params.geometry, Some(&params.panes))

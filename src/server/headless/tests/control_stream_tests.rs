@@ -1693,18 +1693,69 @@ async fn independent_pane_geometry_preserves_shared_viewers_and_handoffs() {
     )
     .unwrap();
     assert_eq!(unsupported["error"]["code"], "unsupported_protocol");
-    let mut invalid = sizes.clone();
-    invalid.get_mut(&ids[0]).unwrap().rows = 0;
-    let rejected = send_control(
+    for (cols, rows) in [(0, 30), (1, 30), (3, 30), (60, 0), (60, 1)] {
+        let mut invalid = sizes.clone();
+        let size = invalid.get_mut(&ids[0]).unwrap();
+        size.cols = cols;
+        size.rows = rows;
+        let rejected = send_control(
+            &mut server,
+            &b,
+            Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+                geometry: geometry_params(&tab, 120, 40, true),
+                panes: invalid,
+            }),
+        )
+        .unwrap();
+        assert_eq!(rejected["error"]["code"], "invalid_request");
+        assert_eq!(server.tab_geometry_controllers.get(&tab), Some(&a_id));
+        assert_eq!(
+            server.app.state.control_pane_geometry[&left],
+            sizes[&ids[0]]
+        );
+        assert_eq!(
+            server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+            (30, 60)
+        );
+    }
+
+    // The minimum accepted grid must be the same in the layout and runtime.
+    let mut minimum = sizes.clone();
+    minimum.get_mut(&ids[0]).unwrap().cols = 4;
+    minimum.get_mut(&ids[0]).unwrap().rows = 2;
+    drain(&a_rx);
+    let accepted = send_control(
         &mut server,
         &a,
         Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
             geometry: geometry_params(&tab, 120, 40, true),
-            panes: invalid,
+            panes: minimum,
         }),
     )
     .unwrap();
-    assert_eq!(rejected["error"]["code"], "invalid_request");
+    assert_eq!(accepted["result"]["type"], "ok");
+    let records = drain(&a_rx);
+    let layout = &records_of(&records, "tab.layout").last().unwrap()["layout"];
+    let pane = layout["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"] == ids[0])
+        .unwrap();
+    assert_eq!(pane["terminal_size"]["cols"], 4);
+    assert_eq!(pane["terminal_size"]["rows"], 2);
+    assert_eq!(
+        server.app.state.workspaces[0].test_runtimes[&left].current_size(),
+        (2, 4)
+    );
+    send_control(
+        &mut server,
+        &a,
+        Method::TabSetPaneGeometry(TabSetPaneGeometryParams {
+            geometry: geometry_params(&tab, 120, 40, true),
+            panes: sizes.clone(),
+        }),
+    );
     let rejected = send_control(
         &mut server,
         &a,

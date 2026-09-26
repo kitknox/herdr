@@ -9,7 +9,7 @@ This review branch is based on kitknox/herdr's `feat/terminal-control-stream` br
 When a native client gives panes different font sizes, one tab-wide cell size cannot describe every terminal grid. Control protocol 3 advertises optional `pane_geometry` and accepts `tab.set_pane_geometry`:
 
 - Existing tab geometry fields retain their meaning and `claim` semantics.
-- `panes` maps pane IDs to `cols`, `rows`, `cell_width_px`, and `cell_height_px`.
+- `panes` maps pane IDs to `cols`, `rows`, `cell_width_px`, and `cell_height_px`. Grids must have at least 4 columns and 2 rows, matching the runtime minimum; smaller requests are rejected before changing ownership or stored geometry.
 - The owning connection's map sizes the terminal runtimes. Other connections can store their preferences without claiming ownership.
 - Protocol-3 layouts carry optional `terminal_size`; `rect` still describes split placement.
 - Protocol-1/2 viewers receive a compatible arrangement of the actual terminal grids. Taking control with the old geometry method restores layout-derived sizing.
