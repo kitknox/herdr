@@ -1,8 +1,8 @@
-# Proposed per-pane geometry for control clients
+# Per-pane geometry for control clients
 
 Companion to the [Rootshell font-size fix](https://github.com/dannyking/rootshell/tree/fix/herdr-zoom-pane-resize), reported in [Rootshell #533](https://github.com/kitknox/rootshell/issues/533).
 
-This review branch is based on kitknox/herdr's `feat/terminal-control-stream` branch at `52ef01b` (rootshell-v0.1.6). It is a proposed change, not a released feature. No implementation PR has been opened against the upstream repositories.
+Prepared for Rootshell fork release v0.1.7, based on v0.1.6. Danny King's original server commit `5971999e` and companion client commit `71287e2e` are preserved in history. This is a fork feature; no implementation PR has been opened against upstream Herdr.
 
 ## Behavior
 
@@ -23,6 +23,6 @@ Shared attachments stay shared. There is still one geometry owner per tab, not a
 - Release build, formatting/Clippy, and six UI hot-path architecture tests passed.
 - Six render-scale benchmarks passed on both the base and candidate. Background combined pipeline medians for 1/15 panes: base 973/1033 microseconds, candidate 998/1061. Active server surface medians: base 603/749, candidate 574/769. These single runs overlapped other builds and are supporting evidence, not precise regression bounds.
 
-Full `just ci`, Linux/Windows validation, and manual multi-client testing remain pending. Automated control-stream coverage includes shared viewers, legacy projections, zoom/unzoom, ownership handoff, and rejected requests leaving state unchanged.
+Fork integration validation: 3,533 enabled Rust tests passed (6 skipped), along with formatting, Clippy, maintenance/integration checks, 7 documentation tests, and the native release build. Local Windows cross-lint remains blocked by the missing Windows SDK; Linux/Windows release builds run in the fork release workflow. Rootshell passed 447 tests and its simulator build. The user confirmed split-pane font resizing on iPad after restarting into the updated server. Full `just ci` and manual multi-client testing remain pending. Automated control-stream coverage includes shared viewers, legacy projections, zoom/unzoom, ownership handoff, and rejected requests leaving state unchanged.
 
 Implementation and tests were AI-assisted; the contributor performed the visual A/B comparison. Both the companion Rootshell client and this server change are required to correct the reported behavior.

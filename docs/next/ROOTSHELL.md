@@ -46,9 +46,26 @@ installer or package manager, then restart the server after saving work.
 Merging the feature upstream does not automatically migrate fork users. We will
 announce an official version containing the feature and migration instructions.
 
+## Control protocol 3
+
+Rootshell v0.1.7 adds `pane_geometry` and `tab.set_pane_geometry` for independent
+per-pane terminal grids. A compatible client can change one pane's font size
+and resize its terminal grid without changing the other panes. Protocol-3
+layouts include `terminal_size` independently from the split-layout `rect`.
+Protocol-1/2 clients remain supported; clients gate the new method on the
+advertised feature. See [per-pane geometry](control-pane-geometry.md).
+
+The companion Rootshell client change is being prepared for an upcoming app
+release. Both client and server support are needed for independent pane sizing.
+Install the update completely before restarting the server, then reconnect the
+client. An already-running server retains its previous protocol and features.
+
+Thanks to Danny King (@dannyking), whose original client and server commits are
+preserved in the repositories.
+
 ## Control protocol 2
 
-Fork releases from this version advertise `terminal_control_stream: 2` and a
+Earlier fork releases advertise `terminal_control_stream: 2` and a
 `control_features` list in `ping` and `control.open` capabilities. Clients gate
 on the feature names, not the number: `shared_attach` (several streams hold one
 pane), `geometry_ownership` (`tab.set_geometry` with `claim`, `tab.claim_geometry`,

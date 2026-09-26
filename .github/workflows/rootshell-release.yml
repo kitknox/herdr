@@ -141,13 +141,15 @@ jobs:
           prerelease: true
           generate_release_notes: true
           body: |
-            Rootshell v0.1.6 updates the fork to Herdr v0.9.1 while preserving control mode, shared terminal attaches, and geometry ownership.
+            Rootshell v0.1.7 adds independent terminal grids for panes in control mode. With a compatible Rootshell client, changing one pane's font size resizes its terminal grid to fill its slot without changing the other panes' fonts.
 
-            Preserves terminal colors, blank and wrapped rows, cursor appearance, and tab stops when restoring control-mode snapshots with the updated terminal engine.
+            Control protocol 3 advertises `pane_geometry`; protocol 1 and 2 clients remain supported. Shared viewing and geometry ownership are preserved. Invalid grids smaller than 4 columns or 2 rows are rejected before changing geometry or ownership.
 
-            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.6`.
+            Thanks to @dannyking (Danny King) for the client and server implementation, reported in https://github.com/kitknox/rootshell/issues/533. His original commits are preserved in both repositories. The companion Rootshell client change is being prepared for an upcoming app release.
 
-            Existing servers keep running their previous binary. Save work before restarting: stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Experimental live handoff is not recommended for this release.
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.7`.
+
+            After installation completes, save work and restart existing servers: stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Reconnect Rootshell afterward. Existing servers keep running their previous binary until restarted. Experimental live handoff is not recommended for this release.
 
             Install on macOS/Linux:
             ```sh
