@@ -24,7 +24,10 @@ mod endpoint_commands;
 mod errors;
 mod events;
 mod frame_output;
+#[cfg(test)]
+mod frame_output_tests;
 mod handshake;
+mod image_files;
 mod input;
 mod loop_config;
 mod notifications;
@@ -48,6 +51,8 @@ use events::ClientLoopEvent;
 use loop_config::ClientLoopConfig;
 use shell_runtime::*;
 use state::ClientState;
+#[cfg(unix)]
+use state::RetiredDirectGraphicsMatch;
 use transport::*;
 
 #[cfg(test)]
@@ -65,13 +70,13 @@ use terminal_geometry::{
 };
 use terminal_geometry::{
     host_cell_size_query_required, initial_terminal_geometry, query_host_cell_size,
-    query_host_terminal_theme, resize_poll_loop, should_query_host_terminal_theme,
+    query_host_terminal_theme, resize_poll_loop,
 };
 #[cfg(unix)]
 use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
 use terminal_setup::{
     effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
-    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor,
+    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
 };
 
 fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
@@ -79,10 +84,9 @@ fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
         warn!(err = %err, "failed to re-assert host mouse capture");
     }
 }
+
 #[cfg(windows)]
-use terminal_setup::{
-    enable_windows_virtual_terminal_input, is_ssh_session, windows_vti_input_backend_enabled,
-};
+use terminal_setup::{is_ssh_session, windows_vti_input_backend_enabled};
 #[cfg(test)]
 use terminal_setup::{
     should_enable_host_color_scheme_reports, windows_virtual_terminal_input_mode,
@@ -124,7 +128,7 @@ use terminal_sessions::terminal_control_command_from_json;
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::io::{self, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
@@ -136,10 +140,20 @@ use tracing::{debug, info, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::render_ansi;
-use crate::protocol::{self, ClientMessage, FrameData, ServerMessage, MAX_GRAPHICS_FRAME_SIZE};
+use crate::protocol::{self, ClientMessage, ServerMessage, MAX_GRAPHICS_FRAME_SIZE};
 #[cfg(test)]
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
+
+/// The decoder for whichever optional surface encodings this connection negotiated.
+fn negotiated_surface_decoder(
+    negotiation: &endpoint::EndpointNegotiation,
+) -> Option<protocol::surface_reuse::Decoder> {
+    let reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
+    let delta = negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+    let scroll = negotiation.supports_capability(protocol::surface_scroll::CAPABILITY);
+    (reuse || delta || scroll).then(|| protocol::surface_reuse::Decoder::new(delta, scroll))
+}
 
 fn run_client_with_mode(
     attach_request: Option<(String, bool)>,
@@ -181,7 +195,7 @@ fn run_client_with_mode(
     let endpoint_keybindings = shell_config
         .as_ref()
         .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
-    let loop_config = ClientLoopConfig {
+    let mut loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
@@ -190,6 +204,8 @@ fn run_client_with_mode(
         pixel_geometry_enabled,
         pixel_geometry_fallback: kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        host_escape_disambiguation_active: false,
+        initial_host_input: Vec::new(),
         endpoint_keybindings,
         remote_image_paste_key,
         shell_config,
@@ -243,6 +259,7 @@ fn run_client_with_mode(
                 endpoint_keybindings,
                 loop_config.mouse_capture_active,
                 true,
+                !is_remote_client_process(),
             )
             .map_err(|error| io::Error::other(error.to_string()))?;
             if federated
@@ -280,7 +297,7 @@ fn run_client_with_mode(
 
     // The federated shell can show connection notices without any server snapshot.
     let direct_attach = attach_escape.is_some();
-    let terminal_guard = if direct_attach {
+    let mut terminal_guard = if direct_attach {
         setup_direct_attach_terminal(mouse_capture)
     } else {
         setup_terminal(mouse_capture)
@@ -289,6 +306,9 @@ fn run_client_with_mode(
         eprintln!("herdr: failed to set up terminal: {err}");
         err
     })?;
+    loop_config.host_escape_disambiguation_active =
+        terminal_guard.host_escape_disambiguation_active();
+    loop_config.initial_host_input = terminal_guard.take_buffered_host_input();
 
     // Install a panic hook so the foreground client always restores its terminal.
     let panic_restore = terminal_guard.panic_restore();
@@ -327,6 +347,7 @@ fn run_client_with_mode(
             should_quit,
             loop_config,
             attach_escape,
+            &terminal_guard,
         )
         .await
     });
@@ -359,6 +380,31 @@ fn run_client_with_mode(
     Ok(())
 }
 
+// This guards server-supplied paths only. Client-owned temporary files generated
+// from received graphics bytes remain usable for remote endpoints.
+fn server_graphics_files_allowed(
+    endpoint_id: &endpoint::ClientEndpointId,
+    remote_client_process: bool,
+) -> bool {
+    endpoint_id.is_local() && !remote_client_process
+}
+
+#[cfg(unix)]
+fn graphics_owner_is_active(
+    state: &ClientState,
+    endpoints: &endpoint::EndpointRegistry,
+    owner: &endpoint::ClientEndpointId,
+) -> bool {
+    endpoints.active_id() == owner
+        && endpoints
+            .connection(owner)
+            .is_some_and(|connection| connection.surface_active)
+        && state
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.endpoint_is_active(owner))
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -375,8 +421,9 @@ async fn run_client_loop(
     initial_cell_height_px: u32,
     initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
-    config: ClientLoopConfig,
+    mut config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
+    _terminal_guard: &TerminalGuard,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
@@ -386,6 +433,7 @@ async fn run_client_loop(
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
+        image_files: image_files::FileTransport::from_environment(),
         mouse_capture_active: config.mouse_capture_active,
         endpoint_mouse_capture_requested: false,
         endpoint_sgr_pixels_requested: false,
@@ -404,7 +452,10 @@ async fn run_client_loop(
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
         #[cfg(unix)]
-        retired_direct_graphics: None,
+        retired_direct_graphics: HashMap::new(),
+        #[cfg(unix)]
+        disabled_native_graphics: Default::default(),
+        pending_native_cleanup: Vec::new(),
         #[cfg(unix)]
         pending_surface_graphics: HashMap::new(),
         attach_escape,
@@ -466,8 +517,9 @@ async fn run_client_loop(
     let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
 
     // Spawn the stdin reader thread.
-    let will_query_host_terminal_theme =
-        state.attach_escape.is_none() && should_query_host_terminal_theme();
+    let will_query_host_terminal_theme = state.attach_escape.is_none();
+    let host_theme_query_pending = Arc::new(AtomicU32::new(0));
+    let stdin_host_theme_query_pending = host_theme_query_pending.clone();
     // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
     // host terminal directly instead of falling back to an assumed cell size.
     let will_query_host_cell_size = state.attach_escape.is_none()
@@ -475,6 +527,8 @@ async fn run_client_loop(
     let stdin_quit = should_quit.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
     let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
+    let stdin_escape_disambiguation_active = config.host_escape_disambiguation_active;
+    let stdin_initial_host_input = std::mem::take(&mut config.initial_host_input);
     #[cfg(unix)]
     let stdin_direct_response = state.direct_graphics_response.clone();
     #[cfg(unix)]
@@ -487,9 +541,12 @@ async fn run_client_loop(
             stdin_tx,
             &stdin_quit,
             will_query_host_terminal_theme,
+            stdin_host_theme_query_pending,
             will_query_host_cell_size,
             stdin_mouse_capture_active,
             stdin_sgr_pixels_active,
+            stdin_escape_disambiguation_active,
+            stdin_initial_host_input,
             #[cfg(unix)]
             stdin_direct_response,
             #[cfg(unix)]
@@ -497,9 +554,9 @@ async fn run_client_loop(
         );
     });
 
+    #[cfg(unix)]
     if will_query_host_terminal_theme {
         query_host_terminal_theme();
-        #[cfg(not(windows))]
         if state.shell.is_some() {
             query_host_terminal_appearance();
         }
@@ -540,10 +597,7 @@ async fn run_client_loop(
             handshake.endpoint_methods.unwrap_or_default(),
             handshake.endpoint_capabilities.unwrap_or_default(),
         );
-        let surface_reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
-        let surface_delta = negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
-        let surface_decoder = (surface_reuse || surface_delta)
-            .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
+        let surface_decoder = negotiated_surface_decoder(&negotiation);
         let transport = start_endpoint_transport(
             stream,
             (),
@@ -680,10 +734,10 @@ async fn run_client_loop(
                     let frozen = state.presentation_frozen;
                     state.presentation_frozen = false;
                     state.present_graphics(&cleanup);
-                    if let Some(frame) = frame {
-                        state.present_frame(frame);
-                    }
                     state.presentation_frozen = frozen;
+                    if let Some(frame) = frame {
+                        state.present_frozen_chrome(frame);
+                    }
                 }
             }
         }
@@ -927,42 +981,70 @@ async fn run_client_loop(
                 let pending_key = state
                     .pending_surface_graphics
                     .keys()
-                    .find(|(_, transfer_id, image_id)| {
+                    .find(|(_, _, transfer_id, image_id)| {
                         *transfer_id == response.transfer_id && *image_id == response.image_id
                     })
                     .cloned();
-                let owner = pending_key
-                    .as_ref()
-                    .map(|(endpoint_id, _, _)| endpoint_id.clone());
-                let composed = pending_key
-                    .and_then(|key| {
-                        state
-                            .pending_surface_graphics
-                            .remove(&key)
-                            .map(|asset| (key, asset))
-                    })
-                    .filter(|_| response.success)
-                    .and_then(|((endpoint_id, _, _), asset)| {
-                        if write_stream.active_id() != &endpoint_id {
+                let pending = pending_key.and_then(|key| {
+                    state
+                        .pending_surface_graphics
+                        .remove(&key)
+                        .map(|asset| (key, asset))
+                });
+                let Some(((owner, _, _, _), asset)) = pending else {
+                    // Raw/non-surface transfers retain their existing response handling.
+                    continue;
+                };
+                let eligible = response.success
+                    && graphics_owner_is_active(&state, &write_stream, &owner)
+                    && !state.presentation_frozen
+                    && state.shell.as_ref().is_some_and(|shell| {
+                        shell.accepts_direct_graphics_asset(&asset, response.image_id)
+                    });
+                let size = state.reported_size;
+                let prepared = eligible
+                    .then(|| {
+                        let shell = state.shell.as_mut()?;
+                        let checkpoint = shell.direct_graphics_checkpoint();
+                        if !shell.trust_direct_graphics_asset(&asset, response.image_id) {
+                            shell.restore_direct_graphics_checkpoint(checkpoint);
                             return None;
                         }
-                        let shell = state.shell.as_mut()?;
-                        shell
-                            .trust_direct_graphics_asset(&asset, response.image_id)
-                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
-                            .flatten()
-                    });
+                        match shell.compose(size.0, size.1) {
+                            Some(frame) => Some((frame, checkpoint)),
+                            None => {
+                                shell.restore_direct_graphics_checkpoint(checkpoint);
+                                None
+                            }
+                        }
+                    })
+                    .flatten();
+                let accepted = if let Some((frame, checkpoint)) = prepared {
+                    if state.try_present_frame(frame) {
+                        true
+                    } else {
+                        state
+                            .shell
+                            .as_mut()
+                            .expect("prepared direct graphics requires a shell")
+                            .restore_direct_graphics_checkpoint(checkpoint);
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !accepted {
+                    // The upload may have reached the terminal even when its response, owner, or
+                    // composed swap cannot be accepted. Never leave that unowned image resident.
+                    // Restoring the checkpoint also restores old-bank stale-image bookkeeping.
+                    state.queue_native_image_cleanup(response.image_id);
+                }
                 let message = ClientMessage::GraphicsTransmissionResult {
                     transfer_id: response.transfer_id,
                     image_id: response.image_id,
-                    success: response.success,
+                    success: accepted,
                 };
-                if let Some(owner) = owner {
-                    write_stream.send_to(&owner, &message);
-                }
-                if let Some(frame) = composed {
-                    state.present_frame(frame);
-                }
+                write_stream.send_to(&owner, &message);
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
@@ -1108,6 +1190,13 @@ async fn run_client_loop(
                 cell_height_px,
                 pixel_geometry_exact,
             ) => {
+                // On Unix, palette changes may lack a color-scheme notification.
+                // Re-query on redraw, including SIGWINCH without a resize.
+                #[cfg(unix)]
+                if will_query_host_terminal_theme {
+                    host_theme_query_pending.fetch_add(1, Ordering::AcqRel);
+                    query_host_terminal_theme();
+                }
                 if !pixel_geometry_exact && host_sgr_pixels_active.load(Ordering::Acquire) {
                     set_mouse_capture(state.mouse_capture_active, false)
                         .map_err(ClientError::ConnectionFailed)?;
@@ -1174,6 +1263,7 @@ async fn run_client_loop(
                     }
                     let unavailable = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_status(&endpoint_id, status);
+                        shell.set_machine_diagnostic(&endpoint_id, message.clone());
                         (status == endpoint::ClientEndpointStatus::Attention
                             && shell.endpoint_is_active(&endpoint_id))
                         .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))
@@ -1201,10 +1291,7 @@ async fn run_client_loop(
                     ) {
                         continue;
                     }
-                    let surface_reuse =
-                        negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
-                    let surface_delta =
-                        negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+                    let surface_decoder = negotiated_surface_decoder(&negotiation);
                     let agent_view_projection_supported = negotiation.supports_capability(
                         crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY,
                     );
@@ -1217,6 +1304,8 @@ async fn run_client_loop(
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
                     let reader_quit = writer.stop_handle();
+                    #[cfg(unix)]
+                    state.start_endpoint_graphics_generation(&endpoint_id, generation);
                     write_stream.insert(
                         endpoint_id.clone(),
                         writer,
@@ -1227,8 +1316,6 @@ async fn run_client_loop(
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }
-                    let surface_decoder = (surface_reuse || surface_delta)
-                        .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
                     let reader_tx = event_tx.clone();
                     std::thread::spawn(move || {
                         server_reader_thread(
@@ -1276,6 +1363,30 @@ async fn run_client_loop(
                     continue;
                 }
                 write_stream.received(&endpoint_id, generation, now);
+                // Retirements belong to the exact live connection, even after deactivation.
+                // They must not be dropped with frozen/inactive presentation effects.
+                if matches!(
+                    message.as_ref(),
+                    ServerMessage::GraphicsTransmissionRetired { .. }
+                ) {
+                    #[cfg(unix)]
+                    if let ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    } = message.as_ref()
+                    {
+                        let owner_active =
+                            graphics_owner_is_active(&state, &write_stream, &endpoint_id);
+                        state.receive_graphics_retirement(
+                            &endpoint_id,
+                            generation,
+                            *transfer_id,
+                            *image_id,
+                            owner_active,
+                        );
+                    }
+                    continue;
+                }
                 let endpoint_active = write_stream.active_id() == &endpoint_id
                     && write_stream
                         .connection(&endpoint_id)
@@ -1452,32 +1563,73 @@ async fn run_client_loop(
                         control,
                         surface_asset,
                     } => {
+                        // Never interpret an SSH server's filesystem path on this host,
+                        // including legacy peers that send files without negotiation.
+                        if !server_graphics_files_allowed(&endpoint_id, is_remote_client_process())
+                        {
+                            write_stream.send_to(
+                                &endpoint_id,
+                                &ClientMessage::GraphicsTransmissionResult {
+                                    transfer_id,
+                                    image_id,
+                                    success: false,
+                                },
+                            );
+                            continue;
+                        }
                         #[cfg(unix)]
                         {
-                            if state.retired_direct_graphics.take()
-                                == Some((endpoint_id.clone(), transfer_id, image_id))
-                            {
+                            let retirement = state.match_retired_direct_graphics(
+                                &endpoint_id,
+                                generation,
+                                transfer_id,
+                                image_id,
+                            );
+                            if retirement == RetiredDirectGraphicsMatch::Exact {
                                 continue;
                             }
                             let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
                                 (Some(shell), Some(asset)) => {
-                                    crate::kitty_graphics::surface::host_image_id(
-                                        shell.graphics_scope(),
-                                        asset,
-                                    ) == image_id
+                                    shell.accepts_direct_graphics_asset(asset, image_id)
                                 }
                                 (None, None) => true,
                                 _ => false,
                             };
-                            let valid = state.kitty_graphics_enabled
+                            let native = surface_asset.as_ref().is_some_and(|asset| {
+                                matches!(
+                                    asset.source,
+                                    crate::protocol::SurfaceGraphicsSource::Terminal { .. }
+                                )
+                            });
+                            let native_valid = !native
+                                || surface_asset.as_ref().is_some_and(|asset| {
+                                    !state.presentation_frozen
+                                        && state.disabled_native_graphics.get(&endpoint_id)
+                                            != Some(&generation)
+                                        && graphics_owner_is_active(
+                                            &state,
+                                            &write_stream,
+                                            &endpoint_id,
+                                        )
+                                        && leading.is_empty()
+                                        && asset.format
+                                            == crate::protocol::SurfaceGraphicsFormat::Rgba
+                                        && expected_len == asset.data_len
+                                        && control
+                                            == format!(
+                                                "a=t,f=32,s={},v={},i={image_id},q=0",
+                                                asset.image_width, asset.image_height
+                                            )
+                                });
+                            let valid = retirement != RetiredDirectGraphicsMatch::Saturated
+                                && state.kitty_graphics_enabled
+                                && native_valid
                                 && surface_asset_valid
                                 && usize::try_from(expected_len).ok().is_some_and(|len| {
-                                    crate::pane_graphics_files::validate_direct_source(
-                                        std::path::Path::new(&path),
-                                        len,
-                                    )
-                                    .is_ok()
-                                        && direct_graphics::valid_control(&control, image_id, len)
+                                    let path = std::path::Path::new(&path);
+                                    let valid_source = crate::pane_graphics_files::validate_direct_source(path, len).is_ok()
+                                        || (native && crate::pane_graphics_files::validate_native_source(path, len).is_ok());
+                                    valid_source && direct_graphics::valid_control(&control, image_id, len)
                                 })
                                 && state
                                     .direct_graphics_response
@@ -1492,8 +1644,9 @@ async fn run_client_loop(
                                     &path,
                                 );
                                 let mut stdout = io::stdout();
-                                let written = stdout
-                                    .write_all(&command)
+                                let written = state
+                                    .flush_native_cleanup(&mut stdout)
+                                    .and_then(|()| stdout.write_all(&command))
                                     .and_then(|()| stdout.flush())
                                     .is_ok();
                                 if written {
@@ -1506,7 +1659,7 @@ async fn run_client_loop(
                             if sent {
                                 if let Some(asset) = surface_asset {
                                     state.pending_surface_graphics.insert(
-                                        (endpoint_id.clone(), transfer_id, image_id),
+                                        (endpoint_id.clone(), generation, transfer_id, image_id),
                                         asset,
                                     );
                                 }
@@ -1517,12 +1670,11 @@ async fn run_client_loop(
                                     transfer_id,
                                     image_id,
                                 };
-                                if let Err(err) = write_to_server(&mut write_stream, &started) {
-                                    return Err(ClientError::ConnectionLost(err));
-                                }
+                                write_stream.send_to(&endpoint_id, &started);
                             } else {
                                 state.pending_surface_graphics.remove(&(
                                     endpoint_id.clone(),
+                                    generation,
                                     transfer_id,
                                     image_id,
                                 ));
@@ -1538,9 +1690,7 @@ async fn run_client_loop(
                                     image_id,
                                     success: false,
                                 };
-                                if let Err(err) = write_to_server(&mut write_stream, &result) {
-                                    return Err(ClientError::ConnectionLost(err));
-                                }
+                                write_stream.send_to(&endpoint_id, &result);
                             }
                         }
                         #[cfg(not(unix))]
@@ -1554,33 +1704,8 @@ async fn run_client_loop(
                             surface_asset,
                         );
                     }
-                    ServerMessage::GraphicsTransmissionRetired {
-                        transfer_id,
-                        image_id,
-                    } => {
-                        #[cfg(unix)]
-                        {
-                            state.retired_direct_graphics =
-                                Some((endpoint_id.clone(), transfer_id, image_id));
-                            state.pending_surface_graphics.remove(&(
-                                endpoint_id.clone(),
-                                transfer_id,
-                                image_id,
-                            ));
-                            let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
-                                shell.retire_direct_graphics_image(image_id);
-                                shell
-                                    .compose(state.reported_size.0, state.reported_size.1)
-                                    .map(|frame| frame.graphics)
-                                    .unwrap_or_else(|| shell.take_pending_graphics_cleanup())
-                            });
-                            state.present_graphics(&cleanup);
-                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                                matcher.retire(transfer_id);
-                            }
-                        }
-                        #[cfg(not(unix))]
-                        let _ = (transfer_id, image_id);
+                    ServerMessage::GraphicsTransmissionRetired { .. } => {
+                        unreachable!("retirements are handled before presentation gating")
                     }
                     ServerMessage::ServerShutdown { reason } => {
                         if !federated && endpoint_id.is_local() {
@@ -1827,17 +1952,21 @@ async fn run_client_loop(
                         );
                         let mouse_mode_changed = enabled != state.mouse_capture_active
                             || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
+                        }
                         if mouse_mode_changed {
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
                             set_mouse_capture(enabled, next_sgr_pixels)
                                 .map_err(ClientError::ConnectionFailed)?;
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
+                        }
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
                         }
                         state.mouse_capture_active = enabled;
                         host_mouse_capture_active.store(enabled, Ordering::Release);
@@ -1892,6 +2021,16 @@ async fn run_client_loop(
                             )) => {
                                 if let Some(shell) = state.shell.as_mut() {
                                     shell.set_endpoint_agent_view_projection_for_generation(
+                                        &endpoint_id,
+                                        generation,
+                                        projection,
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::AgentCompletions(projection)) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_agent_completions(
                                         &endpoint_id,
                                         generation,
                                         projection,
@@ -2110,6 +2249,7 @@ async fn run_client_loop(
                         let (effects, notification_repaint) = shell.tick_notifications(now);
                         outcome.repaint |= notification_repaint
                             | shell.tick_copy_feedback(now)
+                            | shell.tick_workspace_highlight(now)
                             | shell.tick_endpoint_error(now);
                         let frame = outcome
                             .repaint

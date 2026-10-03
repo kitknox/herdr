@@ -1,4 +1,6 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 /// Parse raw terminal input bytes into a list of `RawInputEvent`s.
 ///
@@ -23,6 +25,12 @@ const ESC: u8 = 0x1b;
 pub(crate) const RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS: i32 = 10;
 #[cfg(unix)]
 pub(crate) const MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS: i32 = 150;
+/// Covers the 33 ms split in #4630 without gluing legacy Alt+[ to the next key.
+#[cfg(unix)]
+pub(crate) const MOUSE_ACTIVE_CSI_INTRODUCER_FLUSH_TIMEOUT_MS: i32 = 50;
+/// Covers the 350 ms mouse tail delay in #3480. Other input ends it early (#4751).
+#[cfg(unix)]
+const DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS: i32 = 500;
 pub(crate) const GHOSTTY_COLOR_SCHEME_DARK_REPORT: &[u8] = b"\x1b[?997;1n";
 pub(crate) const GHOSTTY_COLOR_SCHEME_LIGHT_REPORT: &[u8] = b"\x1b[?997;2n";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -84,6 +92,11 @@ impl RawInputFramer {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn host_default_color_query_sent(&mut self, escape_grace: Duration) {
+        self.byte_framer.host_default_color_query_sent(escape_grace);
+    }
+
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<RawInputEvent> {
         Self::events_from_chunks(self.byte_framer.push(data))
     }
@@ -91,6 +104,21 @@ impl RawInputFramer {
     #[cfg(any(windows, test))]
     pub(crate) fn has_pending_input(&self) -> bool {
         self.byte_framer.has_pending_input()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn holds_host_default_color_escape(&self) -> bool {
+        self.byte_framer.buffer.as_slice() == [ESC]
+            && self.byte_framer.host_color_replies_awaited > 0
+            && self
+                .byte_framer
+                .host_default_color_query_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    #[cfg(all(test, not(windows)))]
+    pub(crate) fn holds_host_default_color_escape(&self) -> bool {
+        false
     }
 
     #[cfg(any(windows, test))]
@@ -107,9 +135,21 @@ impl RawInputFramer {
         Self::events_from_chunks(self.byte_framer.flush_timeout())
     }
 
+    #[cfg(any(windows, test))]
+    pub(crate) fn flush_keyboard_escape(&mut self) -> Vec<RawInputEvent> {
+        if self.byte_framer.buffer.as_slice() == [ESC] {
+            self.byte_framer.lone_escape_recently_flushed = true;
+            Self::events_from_chunks(vec![std::mem::take(&mut self.byte_framer.buffer)])
+        } else {
+            self.flush_timeout()
+        }
+    }
+
     /// Semantic input ends mouse recovery, unlike another idle interval.
     #[cfg(any(windows, test))]
     pub(crate) fn flush_interrupted(&mut self) -> Vec<RawInputEvent> {
+        #[cfg(windows)]
+        self.byte_framer.flush_lone_escape_on_interruption();
         let mut chunks = self.byte_framer.flush_timeout();
         self.byte_framer.timed_out_mouse_prefix = None;
         chunks.extend(self.byte_framer.drain_available_chunks());
@@ -144,12 +184,24 @@ pub(crate) struct RawInputByteFramer {
     timed_out_mouse_prefix: Option<Vec<u8>>,
     lone_escape_recently_flushed: bool,
     host_color_replies_awaited: u16,
+    #[cfg(windows)]
+    host_default_color_query_issued: bool,
+    #[cfg(windows)]
+    host_default_color_query_deadline: Option<Instant>,
+    #[cfg(windows)]
+    host_color_tail_deadline: Option<Instant>,
+    #[cfg(windows)]
+    host_color_tail_split_st: bool,
     host_cell_size_replies_awaited: u16,
     host_appearance_reply_awaited: bool,
     held_pending_host_reply_esc: bool,
     host_color_scheme_change_tracking: bool,
     host_appearance_query_on_focus: bool,
     split_coalesced_escape: bool,
+    #[cfg(unix)]
+    host_escape_disambiguation_active: bool,
+    #[cfg(unix)]
+    awaiting_mouse_tail_after: Option<usize>,
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -173,14 +225,43 @@ impl RawInputByteFramer {
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         self.buffer.extend_from_slice(data);
+        #[cfg(unix)]
+        if let Some(prefix_len) = self.awaiting_mouse_tail_after.take() {
+            if !continues_escape_sequence(&self.buffer) {
+                // The prefix already outlived keyboard timing; it was a key.
+                let mut chunks = vec![self.buffer.drain(..prefix_len).collect()];
+                chunks.extend(self.drain_available_chunks());
+                return chunks;
+            }
+        }
         self.drain_available_chunks()
     }
 
     /// Hold a lone trailing ESC for one idle flush so an OSC 10/11 reply split
     /// at its ESC introducer stitches back together instead of leaking (#549).
+    /// Overlapping queries each add their own replies to the window.
     pub(crate) fn host_color_query_sent(&mut self) {
-        self.host_color_replies_awaited = HOST_COLOR_QUERY_REPLIES;
+        self.host_color_query_sent_with_replies(HOST_COLOR_QUERY_REPLIES);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn host_default_color_query_sent(&mut self, reply_window: Duration) {
+        self.host_color_query_sent_with_replies(2);
+        self.host_default_color_query_issued = true;
+        self.host_default_color_query_deadline = Some(Instant::now() + reply_window);
+    }
+
+    fn host_color_query_sent_with_replies(&mut self, replies: u16) {
+        self.host_color_replies_awaited = self.host_color_replies_awaited.saturating_add(replies);
         self.held_pending_host_reply_esc = false;
+    }
+
+    #[cfg(windows)]
+    fn flush_lone_escape_on_interruption(&mut self) {
+        if self.buffer.as_slice() == [ESC] {
+            self.held_pending_host_reply_esc = true;
+            self.host_default_color_query_deadline = None;
+        }
     }
 
     fn host_appearance_query_sent(&mut self) {
@@ -219,8 +300,28 @@ impl RawInputByteFramer {
     }
 
     #[cfg(unix)]
+    pub(crate) fn set_host_escape_disambiguation_active(&mut self, active: bool) {
+        self.host_escape_disambiguation_active = active;
+    }
+
+    /// How long to keep holding input after a first idle flush held it.
+    #[cfg(unix)]
+    pub(crate) fn held_input_flush_timeout_ms(&self) -> i32 {
+        if self.awaiting_mouse_tail_after.is_some() {
+            DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS
+        } else {
+            RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) fn has_pending_lone_escape(&self) -> bool {
         self.buffer.as_slice() == [ESC]
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_pending_csi_introducer(&self) -> bool {
+        self.buffer.as_slice() == b"\x1b["
     }
 
     #[cfg(unix)]
@@ -238,6 +339,16 @@ impl RawInputByteFramer {
     pub(crate) fn flush_timeout(&mut self) -> Vec<Vec<u8>> {
         let mut chunks = self.drain_available_chunks();
 
+        #[cfg(windows)]
+        let host_color_query_expired = self
+            .host_default_color_query_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        #[cfg(windows)]
+        if host_color_query_expired {
+            self.host_default_color_query_deadline = None;
+            self.host_color_replies_awaited = 0;
+        }
+
         // Idle is not evidence that a mouse report has ended. The continuation
         // stays bounded and is released if it cannot complete a valid report.
         if self.timed_out_mouse_prefix.is_some() {
@@ -246,6 +357,10 @@ impl RawInputByteFramer {
 
         if let Some(family) = self.discard_until {
             if family == ControlStringFamily::HostReplyCsi {
+                return chunks;
+            }
+            #[cfg(windows)]
+            if self.host_color_tail_deadline.is_some() {
                 return chunks;
             }
             let keep_split_st = self.buffer.last() == Some(&ESC);
@@ -264,6 +379,24 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.is_empty() {
+            return chunks;
+        }
+
+        // A confirmed host sends Escape as `CSI 27u`, so a mouse report prefix
+        // that outlives keyboard timing may still get a delayed tail (#3480).
+        // Keep it briefly; `push` releases it if other input follows.
+        // A finished mouse wait also counts as this prefix's one-flush host
+        // reply hold, so the two holds never stack.
+        #[cfg(unix)]
+        let mouse_wait_served = self.awaiting_mouse_tail_after.take().is_some();
+        #[cfg(not(unix))]
+        let mouse_wait_served = false;
+        #[cfg(unix)]
+        if !mouse_wait_served
+            && self.host_escape_disambiguation_active
+            && could_continue_as_mouse_report(&self.buffer)
+        {
+            self.awaiting_mouse_tail_after = Some(self.buffer.len());
             return chunks;
         }
 
@@ -299,6 +432,32 @@ impl RawInputByteFramer {
             return chunks;
         }
 
+        #[cfg(windows)]
+        if self.host_default_color_query_issued
+            && is_incomplete_host_default_color_prefix(&self.buffer)
+        {
+            if self.host_default_color_query_deadline.is_some()
+                && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
+            {
+                return chunks;
+            }
+            if host_color_query_expired && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES {
+                self.discard_until = Some(ControlStringFamily::Osc);
+                let split_st = self.buffer.last() == Some(&ESC);
+                self.discarded_tail_bytes = self.buffer.len() - usize::from(split_st);
+                self.host_color_tail_deadline =
+                    Some(Instant::now() + HOST_COLOR_TAIL_RECOVERY_GRACE);
+                self.host_color_tail_split_st = split_st;
+                self.buffer.clear();
+                if split_st {
+                    self.buffer.push(ESC);
+                }
+                return chunks;
+            }
+            self.buffer.clear();
+            return chunks;
+        }
+
         if starts_with_incomplete_default_color_response(&self.buffer) {
             tracing::trace!(
                 len = self.buffer.len(),
@@ -310,7 +469,7 @@ impl RawInputByteFramer {
         if (self.host_cell_size_replies_awaited > 0 || self.host_appearance_reply_awaited)
             && self.buffer.as_slice() == b"\x1b["
         {
-            if !self.held_pending_host_reply_esc {
+            if !self.held_pending_host_reply_esc && !mouse_wait_served {
                 self.held_pending_host_reply_esc = true;
                 tracing::trace!("holding incomplete host CSI reply one flush");
                 return chunks;
@@ -370,13 +529,25 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.as_slice() == [ESC] {
-            if self.awaiting_host_reply() && !self.held_pending_host_reply_esc {
+            #[cfg(windows)]
+            if self.host_color_replies_awaited > 0
+                && self.host_default_color_query_deadline.is_some()
+            {
+                // Native console reply fragments can arrive across several idle polls.
+                return chunks;
+            }
+            if self.awaiting_host_reply() && !self.held_pending_host_reply_esc && !mouse_wait_served
+            {
                 self.held_pending_host_reply_esc = true;
                 tracing::trace!("holding lone escape one flush while awaiting host reply");
                 return chunks;
             }
             // No continuation arrived; give up the window so Escape is not delayed again.
             self.host_color_replies_awaited = 0;
+            #[cfg(windows)]
+            {
+                self.host_default_color_query_deadline = None;
+            }
             self.host_cell_size_replies_awaited = 0;
             self.host_appearance_reply_awaited = false;
             self.held_pending_host_reply_esc = false;
@@ -446,6 +617,57 @@ impl RawInputByteFramer {
             }
 
             if let Some(family) = self.discard_until {
+                #[cfg(windows)]
+                if let Some(deadline) = self.host_color_tail_deadline {
+                    if self.host_color_tail_split_st
+                        && self.buffer.len() > 1
+                        && self.buffer[1] != b'\\'
+                    {
+                        self.buffer.drain(..1);
+                        self.end_host_color_tail_recovery();
+                        continue;
+                    }
+                    let terminator_len = osc_string_terminator(&self.buffer);
+                    if let Some(new_escape) = self
+                        .buffer
+                        .windows(2)
+                        .position(|pair| pair[0] == ESC && pair[1] != b'\\')
+                    {
+                        if terminator_len.is_none_or(|len| new_escape < len) {
+                            self.buffer.drain(..new_escape);
+                            self.end_host_color_tail_recovery();
+                            continue;
+                        }
+                    }
+                    let body_len = terminator_len
+                        .map(|len| len - if self.buffer[len - 1] == 0x07 { 1 } else { 2 })
+                        .unwrap_or(self.buffer.len());
+                    if let Some(invalid) = self.buffer[..body_len]
+                        .iter()
+                        .position(|byte| !plausible_host_color_tail_byte(*byte))
+                    {
+                        self.buffer.drain(..invalid);
+                        self.end_host_color_tail_recovery();
+                        continue;
+                    }
+                    if let Some(terminator_len) = terminator_len {
+                        if self.discarded_tail_bytes + terminator_len
+                            <= MAX_DISCARDED_CONTROL_TAIL_BYTES
+                        {
+                            self.buffer.drain(..terminator_len);
+                            self.end_host_color_tail_recovery();
+                            continue;
+                        }
+                    }
+                    if Instant::now() >= deadline
+                        || self.discarded_tail_bytes + self.buffer.len()
+                            >= MAX_DISCARDED_CONTROL_TAIL_BYTES
+                    {
+                        self.end_host_color_tail_recovery();
+                        continue;
+                    }
+                    break;
+                }
                 if family == ControlStringFamily::HostReplyCsi {
                     if discard_host_reply_csi_tail(&mut self.buffer, &mut self.discarded_tail_bytes)
                     {
@@ -500,9 +722,42 @@ impl RawInputByteFramer {
 
         chunks
     }
+
+    #[cfg(windows)]
+    fn end_host_color_tail_recovery(&mut self) {
+        self.discard_until = None;
+        self.discarded_tail_bytes = 0;
+        self.host_color_tail_deadline = None;
+        self.host_color_tail_split_st = false;
+    }
 }
 
 const MAX_DISCARDED_CONTROL_TAIL_BYTES: usize = 128;
+#[cfg(windows)]
+const HOST_COLOR_TAIL_RECOVERY_GRACE: Duration = Duration::from_millis(100);
+
+#[cfg(windows)]
+fn plausible_host_color_tail_byte(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+        || matches!(
+            byte,
+            b';' | b':'
+                | b'/'
+                | b'#'
+                | b'?'
+                | b'.'
+                | b'_'
+                | b'-'
+                | b'+'
+                | b'r'
+                | b'g'
+                | b'b'
+                | b'R'
+                | b'G'
+                | b'B'
+                | ESC
+        )
+}
 
 fn plausible_control_string_tail(family: ControlStringFamily, buffer: &[u8]) -> bool {
     match family {
@@ -695,6 +950,20 @@ fn starts_with_incomplete_default_color_response(buffer: &[u8]) -> bool {
     ) && matches!(buffer.get(..5), Some(b"\x1b]10;" | b"\x1b]11;"))
 }
 
+#[cfg(windows)]
+fn is_incomplete_host_default_color_prefix(buffer: &[u8]) -> bool {
+    buffer.starts_with(b"\x1b]")
+        && matches!(
+            control_string(buffer),
+            Some(ControlString::Incomplete {
+                family: ControlStringFamily::Osc
+            })
+        )
+        && [b"\x1b]10;".as_slice(), b"\x1b]11;".as_slice()]
+            .iter()
+            .any(|prefix| prefix.starts_with(buffer) || buffer.starts_with(prefix))
+}
+
 fn starts_with_incomplete_host_color_scheme_report(buffer: &[u8]) -> bool {
     buffer.starts_with(b"\x1b[?")
         && (GHOSTTY_COLOR_SCHEME_DARK_REPORT.starts_with(buffer)
@@ -829,6 +1098,26 @@ fn starts_with_incomplete_sgr_mouse_sequence(buffer: &[u8]) -> bool {
         && buffer[3..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
+/// Whether bytes after a held ESC or ESC[ still read as one escape sequence,
+/// such as a mouse report, host reply, or bracketed paste, rather than a key.
+#[cfg(unix)]
+fn continues_escape_sequence(buffer: &[u8]) -> bool {
+    match buffer {
+        [ESC] | [ESC, b'['] => true,
+        // OSC, DCS and APC host replies can also split after their ESC.
+        [ESC, b']' | b'P' | b'_', ..] => true,
+        [ESC, b'[', next, ..] => *next == b'M' || matches!(*next, 0x20..=0x3f),
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn could_continue_as_mouse_report(buffer: &[u8]) -> bool {
+    [b"\x1b[<".as_slice(), b"\x1b[M"]
+        .iter()
+        .any(|prefix| buffer.starts_with(prefix) || prefix.starts_with(buffer))
 }
 
 #[cfg(any(unix, windows, test))]
@@ -2420,6 +2709,121 @@ mod tests {
         assert!(framer.flush_timeout().is_empty());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_color_prefix_respects_query_deadline() {
+        let mut framer = RawInputFramer::for_host_input();
+        framer.host_default_color_query_sent(Duration::from_secs(1));
+        assert!(framer.push(b"\x1b]10").is_empty());
+        for _ in 0..3 {
+            assert!(framer.flush_timeout().is_empty());
+        }
+        assert!(framer.push(b";rgb:aaaa/").is_empty());
+        for _ in 0..3 {
+            assert!(framer.flush_timeout().is_empty());
+        }
+        assert!(matches!(
+            framer.push(b"bbbb/cccc\x1b\\").as_slice(),
+            [RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Foreground,
+                ..
+            }]
+        ));
+
+        let mut expired = RawInputFramer::for_host_input();
+        expired.host_default_color_query_sent(Duration::ZERO);
+        assert!(expired.push(b"\x1b]11;").is_empty());
+        assert!(expired.flush_timeout().is_empty());
+        assert!(matches!(
+            expired.push(b"x").as_slice(),
+            [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
+        ));
+        assert!(matches!(
+            expired.push(b"\x1b]11;rgb:1111/2222/3333\x1b\\").as_slice(),
+            [RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Background,
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_expired_host_color_reply_tail_does_not_reach_pane() {
+        let mut framer = RawInputFramer::for_host_input();
+        framer.host_default_color_query_sent(Duration::ZERO);
+        assert!(framer.push(b"\x1b]11;rgb:1111/").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.push(b"2222/").is_empty());
+        for _ in 0..3 {
+            assert!(framer.flush_timeout().is_empty());
+        }
+        assert!(matches!(
+            framer.push(b"3333\x1b\\x").as_slice(),
+            [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
+        ));
+
+        let mut expired = RawInputFramer::for_host_input();
+        expired.host_default_color_query_sent(Duration::ZERO);
+        assert!(expired.push(b"\x1b]10;rgb:aaaa/").is_empty());
+        assert!(expired.flush_timeout().is_empty());
+        expired.byte_framer.host_color_tail_deadline = Some(Instant::now());
+        assert!(expired.flush_timeout().is_empty());
+        assert!(matches!(
+            expired.push(b"y").as_slice(),
+            [RawInputEvent::Key(key)] if key.code == KeyCode::Char('y')
+        ));
+
+        let mut raw_keyboard = RawInputFramer::for_host_input();
+        raw_keyboard.host_default_color_query_sent(Duration::ZERO);
+        assert!(raw_keyboard.push(b"\x1b]11;rgb:1111/").is_empty());
+        assert!(raw_keyboard.flush_timeout().is_empty());
+        assert!(raw_keyboard.push(b"a").is_empty());
+        raw_keyboard.byte_framer.host_color_tail_deadline = Some(Instant::now());
+        assert!(matches!(
+            raw_keyboard.flush_timeout().as_slice(),
+            [RawInputEvent::Key(key)] if key.code == KeyCode::Char('a')
+        ));
+
+        let mut split_st = RawInputFramer::for_host_input();
+        split_st.host_default_color_query_sent(Duration::ZERO);
+        assert!(split_st.push(b"\x1b]11;rgb:1111/2222/3333\x1b").is_empty());
+        assert!(split_st.flush_timeout().is_empty());
+        assert!(matches!(
+            split_st.push(b"\\x").as_slice(),
+            [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
+        ));
+
+        let mut abandoned_st = RawInputFramer::for_host_input();
+        abandoned_st.host_default_color_query_sent(Duration::ZERO);
+        assert!(abandoned_st
+            .push(b"\x1b]11;rgb:1111/2222/3333\x1b")
+            .is_empty());
+        assert!(abandoned_st.flush_timeout().is_empty());
+        assert!(matches!(
+            abandoned_st
+                .push(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\")
+                .as_slice(),
+            [RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Foreground,
+                ..
+            }]
+        ));
+
+        let mut next_reply = RawInputFramer::for_host_input();
+        next_reply.host_default_color_query_sent(Duration::ZERO);
+        assert!(next_reply.push(b"\x1b]11;rgb:1111/").is_empty());
+        assert!(next_reply.flush_timeout().is_empty());
+        assert!(next_reply.push(b"\x1b").is_empty());
+        assert!(matches!(
+            next_reply.push(b"]10;rgb:aaaa/bbbb/cccc\x1b\\").as_slice(),
+            [RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Foreground,
+                ..
+            }]
+        ));
+    }
+
     #[test]
     fn holds_lone_escape_and_stitches_split_host_color_reply() {
         let mut framer = RawInputByteFramer::default();
@@ -2744,5 +3148,35 @@ mod tests {
         // Window closed: a later lone Escape flushes immediately.
         assert!(framer.push(b"\x1b").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b".to_vec()]);
+    }
+
+    #[test]
+    fn overlapping_host_color_queries_keep_holding_split_reply_escape() {
+        use std::fmt::Write as _;
+
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        framer.host_color_query_sent();
+        let mut first_batch =
+            String::from("\x1b]10;rgb:6565/7b7b/8383\x1b\\\x1b]11;rgb:2424/2727/3a3a\x1b\\");
+        for index in 0..=u8::MAX {
+            let _ = write!(first_batch, "\x1b]4;{index};rgb:1111/2222/3333\x1b\\");
+        }
+        assert_eq!(framer.push(first_batch.as_bytes()).len(), 258);
+
+        // The second batch is still outstanding, so its first reply split at ESC
+        // must not leak into the pane as an Escape key.
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        let chunks = framer.push(b"]10;rgb:eeee/eeee/eeee\x1b\\");
+        assert_eq!(chunks.len(), 1);
+        let (event, _) = extract_one_event(&chunks[0]).unwrap();
+        assert!(matches!(
+            event,
+            RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Foreground,
+                ..
+            }
+        ));
     }
 }

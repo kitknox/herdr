@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.09.14.1"
+version = "2026.09.23.1"
 min_engine_version = 3
-updated_at = "2026-09-14T00:00:00Z"
+updated_at = "2026-09-23T22:12:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -62,6 +62,7 @@ any = [
   { contains = ["enter to submit answer"] },
   { contains = ["enter to submit all"] },
   { contains = ["allow command?"] },
+  { contains = ["All Results", "Filesystem Only", "Plugins"] },
 ]
 
 [[rules]]
@@ -84,20 +85,10 @@ state = "working"
 priority = 500
 region = "before_current_prompt_marker"
 visible_working = true
-# Cheap negative filter before the multiline search.
-contains = ["esc to interrupt"]
-# Animations can hide the bullet, and queued inputs can sit below a dynamic activity label.
-# Require the live timer/control suffix with no later response or interruption marker.
-regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s • esc to interrupt\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+esc\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
-
-[[rules]]
-id = "osc_title_idle"
-state = "idle"
-priority = 100
-region = "osc_title"
-visible_idle = true
-regex = ['\S']
-not = [
-  { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
-  { contains = ["Action Required"] },
-]
+# Support animated and reduced-motion status, including dynamic activity labels.
+# The interrupt hint can be remapped, unbound, or hidden, and queued inputs can
+# sit below the status. Require the live timer suffix with no later response.
+any = [{ contains = [" to interrupt)"] }, { contains = ["s)"] }]
+regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
+# A failed reconnect keeps its final elapsed timer but is no longer working.
+not = [{ line_regex = ['^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$'] }]

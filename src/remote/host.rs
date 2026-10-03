@@ -20,6 +20,8 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
         }
     };
     ensure_remote_server_running()?;
+    #[cfg(unix)]
+    let _ssh_agent = super::ssh_agent::Registration::start();
 
     let socket_path = crate::server::socket_paths::client_socket_path();
     let stream = crate::ipc::connect_local_stream(&socket_path).map_err(|err| {

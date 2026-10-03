@@ -3,6 +3,39 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+#[cfg(unix)]
+pub(crate) mod ssh_agent;
+
+pub(crate) struct HostShutdownMonitor {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HostShutdownMonitor {
+    pub(crate) fn start(
+        requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let task = monitor_host_shutdown(requested, wake);
+        Self { task }
+    }
+}
+
+impl Drop for HostShutdownMonitor {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monitor_host_shutdown(
+    _requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _wake: impl Fn() + Send + Sync + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
@@ -48,7 +81,9 @@ impl ChildExitReason {
 }
 
 #[cfg(unix)]
-pub(crate) use unix_common::classify_child_exit;
+pub(crate) use unix_common::{
+    classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+};
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn classify_child_exit(_status: &portable_pty::ExitStatus) -> ChildExitReason {
@@ -292,6 +327,8 @@ mod remote_bridge;
 mod remote_bridge_tests;
 #[cfg(unix)]
 mod unix_common;
+#[cfg(unix)]
+pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, RemoteBridgeWake,
@@ -678,4 +715,15 @@ mod tests {
             LimitedRead::Complete(b"image".to_vec())
         );
     }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn shared_ssh_control_path(
+    _namespace: &std::path::Path,
+    _target: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "interactive SSH recovery requires Unix OpenSSH multiplexing",
+    ))
 }

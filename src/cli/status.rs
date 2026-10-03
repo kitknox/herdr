@@ -174,7 +174,7 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
 }
 
 fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
-    match super::target::api_client()?.status() {
+    match super::target::server_status(&super::target::api_client()?) {
         Ok(status) => Ok(ServerRuntimeStatus::Running {
             version: status.version,
             protocol: status.protocol,
@@ -280,6 +280,7 @@ struct ServerCapabilitiesJson {
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
+    ssh_agent_registration: bool,
     terminal_control_stream: u32,
     control_features: Vec<String>,
 }
@@ -327,6 +328,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
+                    ssh_agent_registration: capabilities.ssh_agent_registration,
                     terminal_control_stream: capabilities.terminal_control_stream,
                     control_features: capabilities.control_features.clone(),
                 }),
@@ -426,11 +428,19 @@ mod tests {
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
+                ssh_agent_registration: false,
                 terminal_control_stream: 0,
                 control_features: Vec::new(),
                 server_pid: None,
             }),
         }
+    }
+
+    #[test]
+    fn status_exposes_ssh_agent_registration() {
+        let server = running_server(Some("test"), None);
+        let value = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(value["capabilities"]["ssh_agent_registration"], false);
     }
 
     #[test]

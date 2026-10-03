@@ -23,7 +23,6 @@ fn send_control(
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
         control: Some(handle.clone()),
     });
     let response = response_rx.recv().expect("control response");
@@ -42,7 +41,6 @@ fn send_plain(server: &mut HeadlessServer, method: Method) -> serde_json::Value 
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
         control: None,
     });
     serde_json::from_str(&response_rx.recv().expect("response")).expect("json")

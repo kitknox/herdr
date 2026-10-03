@@ -23,12 +23,12 @@ pub fn encode_terminal_key(key: TerminalKey, protocol: KeyboardProtocol) -> Vec<
         return Vec::new();
     }
 
-    // Super has no legacy character encoding. Preserve the chord with CSI-u
-    // instead of leaking the unmodified character into the pane.
+    // Super has no legacy character encoding, and Ctrl+Shift+letter would
+    // collapse into the same C0 byte as Ctrl+letter. Preserve both chords with
+    // CSI-u, matching Ghostty's legacy encoder.
     if matches!(protocol, KeyboardProtocol::Legacy)
         && key.kind != crossterm::event::KeyEventKind::Release
-        && matches!(key.code, KeyCode::Char(_))
-        && key.modifiers.contains(KeyModifiers::SUPER)
+        && legacy_chord_needs_csi_u(&key)
     {
         if let Some(bytes) = try_encode_csi_u(&key, 0) {
             return bytes;
@@ -79,6 +79,17 @@ pub fn encode_terminal_key(key: TerminalKey, protocol: KeyboardProtocol) -> Vec<
         return Vec::new();
     }
     encode_legacy(key)
+}
+
+fn legacy_chord_needs_csi_u(key: &TerminalKey) -> bool {
+    let KeyCode::Char(ch) = key.code else {
+        return false;
+    };
+    key.modifiers.contains(KeyModifiers::SUPER)
+        || (ch.is_ascii_alphabetic()
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT))
 }
 
 #[allow(dead_code)] // exercised in input unit tests; production uses TerminalRuntime helpers
@@ -623,6 +634,48 @@ mod tests {
     fn legacy_ctrl_c() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(encode_key(key, KeyboardProtocol::Legacy), vec![3]);
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_letter_preserves_shift_with_csi_u() {
+        for ch in ['c', 'C'] {
+            let key = KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                encode_key(key, KeyboardProtocol::Legacy),
+                b"\x1b[99;6u",
+                "ch={ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_ctrl_alt_shift_letter_uses_csi_u() {
+        let key = KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(encode_key(key, KeyboardProtocol::Legacy), b"\x1b[99;8u");
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_letter_from_kitty_host_input_keeps_shift() {
+        let key = parse_terminal_key_sequence("\x1b[99:67;6:1u").expect("Ctrl+Shift+C");
+        assert_eq!(
+            encode_terminal_key(key, KeyboardProtocol::Legacy),
+            b"\x1b[99;6u"
+        );
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_punctuation_keeps_c0_byte() {
+        let key = KeyEvent::new(
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(encode_key(key, KeyboardProtocol::Legacy), vec![31]);
     }
 
     #[test]

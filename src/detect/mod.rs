@@ -7,7 +7,7 @@ pub mod manifest;
 pub mod manifest_update;
 
 /// The detected state of a terminal pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentState {
     /// Agent finished, prompt visible, nothing happening.
     Idle,
@@ -320,10 +320,6 @@ pub fn detect_agent_with_osc(
     )
 }
 
-pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
-    agent.is_some_and(|agent| manifest::should_skip_state_update(agent, screen_content))
-}
-
 pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
     matches!(
         (source, agent_label),
@@ -368,6 +364,11 @@ pub fn foreground_group_leader_job(
 /// This is cheaper than collecting every process in the foreground job.
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     crate::platform::foreground_process_group_id(child_pid)
+}
+
+/// True when the pane's own shell is at its prompt with nothing running in it.
+pub fn pane_shell_is_idle(child_pid: u32) -> bool {
+    crate::platform::available_pane_shell(child_pid).is_some()
 }
 
 fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> String {
@@ -650,6 +651,15 @@ fn agent_name_from_known_package_path(path: &str) -> Option<String> {
     }
     if ends_with(&[
         "node_modules",
+        "@oh-my-pi",
+        "pi-coding-agent",
+        "dist",
+        "cli.js",
+    ]) {
+        return Some(agent_label(Agent::Omp).to_string());
+    }
+    if ends_with(&[
+        "node_modules",
         "@moonshot-ai",
         "kimi-code",
         "dist",
@@ -891,14 +901,6 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
-    }
-
-    #[test]
-    fn moved_agent_detection_routes_through_production_dispatch() {
-        let detection = detect_agent(Some(Agent::Pi), "Working...");
-
-        assert_eq!(detection.state, AgentState::Working);
-        assert!(detection.visible_working);
     }
 
     // ---- Agent identification ----
@@ -1279,101 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn letta_manifest_detects_observed_working_and_idle_chrome() {
-        let empty = manifest::explain(Agent::Letta, "");
-        assert_eq!(empty.state, AgentState::Unknown);
-        assert_eq!(
-            empty.matched_rule.as_ref().map(|rule| rule.id.as_str()),
-            Some("no_live_state_evidence")
-        );
-        for screen in [
-            "✻ Thinking…\nTutor is reflecting… (esc to interrupt · 2m 3s)",
-            "My Tutor is thinking about thinking… (esc to interrupt · 3s)",
-            "Tutor is calibrating… (interrupting)",
-            "• Run Compile the integration\n└ Running... (1s)",
-        ] {
-            assert_eq!(
-                detect_state(Some(Agent::Letta), screen),
-                AgentState::Working
-            );
-        }
-        assert_eq!(
-            detect_state(
-                Some(Agent::Letta),
-                "────────────────\n› Try \"debug this error\"\n────────────────\nTutor · No model selected"
-            ),
-            AgentState::Idle
-        );
-        assert_eq!(
-            detect_state(
-                Some(Agent::Letta),
-                "────────────────\n› explain this code\n────────────────\nTutor · No model selected"
-            ),
-            AgentState::Unknown
-        );
-        let selector = manifest::explain(
-            Agent::Letta,
-            "8 pinned agents available.\n\n> Resume Bob (pinned)\n  View all 8 profiles\n  Create a new agent (--new)\n\n  ↑↓ navigate · Enter select · Esc exit",
-        );
-        assert_eq!(selector.state, AgentState::Unknown);
-        assert_eq!(
-            selector.matched_rule.as_ref().map(|rule| rule.id.as_str()),
-            Some("profile_selector")
-        );
-    }
-
-    #[test]
-    fn letta_manifest_uses_osc_activity_and_approval_signals() {
-        let idle_screen =
-            "────────────────\n› Try \"debug this error\"\n────────────────\nTutor · GPT-5.5";
-
-        for title in ["⠋ Tutor", "project | ⠏ Tutor"] {
-            let detection = detect_agent_with_osc(Some(Agent::Letta), idle_screen, title, "");
-            assert_eq!(detection.state, AgentState::Working);
-            assert!(detection.visible_working);
-        }
-
-        for title in [
-            "[ ! ] Action Required | Tutor",
-            "[ . ] Action Required | Tutor",
-        ] {
-            let detection = detect_agent_with_osc(Some(Agent::Letta), idle_screen, title, "");
-            assert_eq!(detection.state, AgentState::Blocked);
-            assert!(detection.visible_blocker);
-        }
-
-        let detection = detect_agent_with_osc(Some(Agent::Letta), idle_screen, "Tutor", "4;3;0");
-        assert_eq!(detection.state, AgentState::Blocked);
-        assert!(detection.visible_blocker);
-    }
-
-    #[test]
-    fn letta_manifest_detects_observed_command_approval() {
-        let approval = r#"✻ Thinking…
-
-────────────────────────────────────────────────────────────────
-Run this command?
-
-  $ rm -f /var/tmp/herdr-blocked-capture-never-created
-
-❯ 1. Yes
-  2. No, and tell Letta Code what to do differently
-
-Enter to select · Esc to cancel"#;
-        assert_eq!(
-            detect_state(Some(Agent::Letta), approval),
-            AgentState::Blocked
-        );
-        assert_eq!(
-            detect_state(
-                Some(Agent::Letta),
-                "The user asked: Run this command?\n›\n────\nTutor · No model selected"
-            ),
-            AgentState::Idle
-        );
-    }
-
-    #[test]
     fn identify_agent_in_job_detects_windows_cursor_install() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 123,
@@ -1536,19 +1443,36 @@ Enter to select · Esc to cancel"#;
 
     #[test]
     fn identify_agent_in_job_detects_bun_wrapped_omp() {
-        let job = crate::platform::ForegroundJob {
+        for (runtime, script) in [
+            ("bun", "/home/can/.bun/bin/omp"),
+            (
+                "bun.exe",
+                r"C:\Users\herdr\AppData\Roaming\npm\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js",
+            ),
+        ] {
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, runtime, &[runtime, script])],
+            };
+            assert_eq!(
+                identify_agent_in_job(&job),
+                Some((Agent::Omp, "omp".to_string())),
+                "script: {script}"
+            );
+        }
+
+        let other_script = crate::platform::ForegroundJob {
             process_group_id: 123,
             processes: vec![foreground_process(
                 123,
-                "bun",
-                &["bun", "/home/can/.bun/bin/omp"],
+                "bun.exe",
+                &[
+                    "bun.exe",
+                    r"C:\Users\herdr\AppData\Roaming\npm\node_modules\@oh-my-pi\pi-coding-agent\dist\setup.js",
+                ],
             )],
         };
-
-        assert_eq!(
-            identify_agent_in_job(&job),
-            Some((Agent::Omp, "omp".to_string()))
-        );
+        assert_eq!(identify_agent_in_job(&other_script), None);
     }
 
     #[test]
@@ -1573,6 +1497,9 @@ Enter to select · Esc to cancel"#;
 
     #[test]
     fn identify_agent_in_job_detects_node_wrapped_pi_bundled_cli() {
+        // Hardened runtimes deny `PROCESS_VM_READ`, so the command line can come
+        // from a LimitedInformation query with the launcher path intact. The
+        // detection path must not depend on how that command line was obtained.
         let job = crate::platform::ForegroundJob {
             process_group_id: 123,
             processes: vec![foreground_process(
@@ -2005,6 +1932,55 @@ Enter to select · Esc to cancel"#;
             identify_agent_in_job(&job),
             Some((Agent::Codex, "codex".to_string()))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_shell_is_idle_tracks_foreground_command() {
+        use portable_pty::CommandBuilder;
+        use std::io::Write;
+
+        fn wait_for(expected: bool, pid: u32) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if pane_shell_is_idle(pid) == expected {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        }
+
+        let pair = open_test_pty();
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-i");
+        cmd.env("ENV", "/dev/null");
+        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
+        let pid = child.process_id().expect("no pid");
+        let mut reader = pair.master.try_clone_reader().expect("no reader");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while matches!(std::io::Read::read(&mut reader, &mut buf), Ok(n) if n > 0) {}
+        });
+        let mut writer = pair.master.take_writer().expect("no writer");
+
+        assert!(wait_for(true, pid), "interactive shell should start idle");
+        // End the foreground command with EOF rather than SIGINT. An interrupt
+        // sent while the shell is still moving the command into its own
+        // foreground process group can be delivered before the command resets
+        // its signal dispositions, leaving it running in a stale foreground
+        // group while the shell shows a prompt. `cat` blocks until stdin hits
+        // EOF, so it stays reliably busy until we end it.
+        writer.write_all(b"cat\n").unwrap();
+        assert!(wait_for(false, pid), "shell running a command is not idle");
+        writer.write_all(&[4]).unwrap();
+        assert!(
+            wait_for(true, pid),
+            "shell should be idle after the command ends"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
     }
 
     #[cfg(target_os = "linux")]

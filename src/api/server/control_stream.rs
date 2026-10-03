@@ -8,6 +8,7 @@
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 use interprocess::local_socket::traits::Stream as _;
@@ -23,7 +24,6 @@ use crate::api::subscriptions::ActiveSubscription;
 use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::{is_connection_closed_error, LocalStream, LocalStreamReadCount};
 
-use super::pane_graphics_stream::PollBackoff;
 use super::{
     dispatch_to_app_with_control, error_response_json, write_text_line, CONNECTION_POLL_INTERVAL,
 };
@@ -31,8 +31,12 @@ use super::{
 /// Largest request line a control stream accepts; pastes arrive base64 encoded.
 const MAX_CONTROL_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// How often a blocked reader re-checks that the stream is still alive.
-const READER_WAKE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const READER_WAKE_INTERVAL: Duration = Duration::from_secs(1);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+/// First poll interval for transports without a receive timeout.
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Polls kept at the first interval before backing off.
+const FALLBACK_FAST_POLLS: u8 = 32;
 
 pub(super) fn serve(
     mut stream: LocalStream,
@@ -96,7 +100,7 @@ pub(super) fn serve(
             'poll: while handle.is_alive() && running.load(Ordering::Relaxed) {
                 if let Ok(mut subscriptions) = subscriptions.lock() {
                     for subscription in subscriptions.iter_mut() {
-                        let (events, gap) = subscription.poll_batch(&api_tx, &event_hub);
+                        let (events, gap) = subscription.poll_batch_with_gap(&api_tx, &event_hub);
                         if let Some(gap) = gap {
                             if handle.protocol() >= 2 && announced_gap != Some(gap.resume_sequence)
                             {
@@ -232,7 +236,7 @@ fn reader_loop(
 ) -> io::Result<()> {
     // Waking periodically lets the loop notice a dead writer (a client that
     // stopped reading) and release the attaches instead of blocking forever.
-    // Named pipes have no receive timeout, so they poll like graphics streams.
+    // Named pipes have no receive timeout, so they poll with backoff instead.
     let mut wait = match stream.set_recv_timeout(Some(READER_WAKE_INTERVAL)) {
         Ok(()) => ReaderWait::SocketTimeout,
         Err(err) if err.kind() == io::ErrorKind::Unsupported => {
@@ -309,6 +313,34 @@ fn reader_loop(
 enum ReaderWait {
     SocketTimeout,
     Poll(PollBackoff),
+}
+
+/// Read polling for streams whose transport has no receive timeout.
+#[derive(Clone, Copy)]
+struct PollBackoff {
+    interval: Duration,
+    fast_polls_remaining: u8,
+}
+
+impl PollBackoff {
+    fn new() -> Self {
+        Self {
+            interval: FALLBACK_POLL_INTERVAL,
+            fast_polls_remaining: FALLBACK_FAST_POLLS,
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.fast_polls_remaining > 0 {
+            self.fast_polls_remaining -= 1;
+            return;
+        }
+        self.interval = (self.interval * 2).min(CONNECTION_POLL_INTERVAL);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
 }
 
 /// Request bytes split across reads. The line size cap spans every read,
@@ -408,7 +440,6 @@ fn handle_request_line(
         Method::AgentPrompt(_) => unsupported(request_id.clone(), "agent.prompt"),
         Method::AgentWait(_) => unsupported(request_id.clone(), "agent.wait"),
         Method::PaneWaitForOutput(_) => unsupported(request_id.clone(), "pane.wait_for_output"),
-        Method::PaneGraphicsStream(_) => unsupported(request_id.clone(), "pane.graphics.stream"),
         method => dispatch_to_app_with_control(
             Request {
                 id: request_id.clone(),

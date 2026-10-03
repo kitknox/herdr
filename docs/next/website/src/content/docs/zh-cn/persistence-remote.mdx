@@ -148,4 +148,4 @@ herdr terminal session observe w1:p1 --cols 120 --rows 40
 herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 ```
 
-控制模式输出相同的帧，并从标准输入读取逐行 JSON 命令。`terminal.input` 发送文本或 base64 数据，`terminal.resize` 更改视口尺寸，`terminal.scroll` 滚动视口，`terminal.release` 关闭控制器。同一时间只有一个控制器能拥有输入和调整尺寸的权限。
+控制模式输出相同的帧，并从标准输入读取逐行 JSON 命令。`terminal.input` 发送文本或 base64 数据，`terminal.resize` 更改视口尺寸，`terminal.scroll` 滚动视口，`terminal.mouse` 向已开启鼠标报告的应用发送单元格位置的鼠标事件，`terminal.release` 关闭控制器。同一时间只有一个控制器能拥有输入和调整尺寸的权限。

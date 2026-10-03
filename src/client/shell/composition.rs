@@ -40,6 +40,12 @@ impl ClientShellState {
                 .navigate_workspace_id
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
+        let pending_workspace_highlight =
+            self.pending_workspace_highlight.as_ref().filter(|pending| {
+                self.mode != ClientShellMode::Navigate
+                    && pending.target.endpoint_id == self.active_endpoint_id
+                    && self.navigation_target_valid(&pending.target)
+            });
         // A resize invalidates pane geometry, not the healthy Local workspace chrome.
         let local_snapshot = self.snapshot.as_deref().filter(|_| {
             self.endpoints.len() == 1
@@ -49,6 +55,7 @@ impl ClientShellState {
                     == Some(ClientEndpointStatus::Online)
         });
         let mut render_state = render::ShellRenderState {
+            machine_diagnostics: &self.machine_diagnostics,
             endpoints: &self.endpoints,
             active_endpoint_id: &self.active_endpoint_id,
             collapsed_endpoints: &self.collapsed_endpoints,
@@ -65,7 +72,8 @@ impl ClientShellState {
             selected_workspace_id: self
                 .navigate_workspace_id
                 .as_ref()
-                .filter(|_| valid_navigation_target),
+                .filter(|_| valid_navigation_target)
+                .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
@@ -127,10 +135,23 @@ impl ClientShellState {
             &self.config.keybinds,
             &self.config.palette,
         );
+        if let Some(notice) = &self.visible_endpoint_notice {
+            self.hits.notification_toast = endpoint_notices::render_notice(
+                &mut buffer,
+                Rect::new(0, 0, cols, rows),
+                notice,
+                1,
+                &self.config.palette,
+            );
+        }
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
     }
 
-    pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+    pub(crate) fn compose(
+        &mut self,
+        cols: u16,
+        rows: u16,
+    ) -> Option<crate::client::frame_output::ComposedFrame> {
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -143,8 +164,14 @@ impl ClientShellState {
                 .navigate_workspace_id
                 .as_ref()
                 .is_some_and(|target| self.navigation_target_valid(target));
+        let pending_workspace_highlight =
+            self.pending_workspace_highlight.as_ref().filter(|pending| {
+                self.mode != ClientShellMode::Navigate
+                    && pending.target.endpoint_id == self.active_endpoint_id
+                    && self.navigation_target_valid(&pending.target)
+            });
         if self.snapshot.is_none() || self.pane_surface.is_none() {
-            return Some(self.compose_unavailable(cols, rows));
+            return Some(self.compose_unavailable(cols, rows).into());
         }
         let snapshot = self.snapshot.as_deref()?;
         // Do not compose a retained surface while waiting for its matching snapshot or
@@ -184,6 +211,7 @@ impl ClientShellState {
             snapshot,
             &self.config,
             render::ShellRenderState {
+                machine_diagnostics: &self.machine_diagnostics,
                 endpoints: &self.endpoints,
                 active_endpoint_id: &self.active_endpoint_id,
                 collapsed_endpoints: &self.collapsed_endpoints,
@@ -200,7 +228,8 @@ impl ClientShellState {
                 selected_workspace_id: self
                     .navigate_workspace_id
                     .as_ref()
-                    .filter(|_| valid_navigation_target),
+                    .filter(|_| valid_navigation_target)
+                    .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
@@ -649,6 +678,8 @@ impl ClientShellState {
                 self.hits.navigator_popup = rendered.navigator_popup;
                 self.hits.navigator_search = rendered.navigator_search;
                 self.hits.navigator_rows = rendered.navigator_rows;
+                self.hits.navigator_scrollbar = rendered.navigator_scrollbar;
+                self.hits.navigator_scroll_metrics = rendered.navigator_scroll_metrics;
                 self.hits.worktree_search = rendered.worktree_search;
                 self.hits.worktree_rows = rendered.worktree_rows;
                 self.hits.help_popup = rendered.help_popup;
@@ -689,8 +720,8 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
-        self.compose_graphics(&mut frame, layout, &occlusion);
-        Some(frame)
+        let graphics = self.compose_graphics(layout, &occlusion);
+        Some(crate::client::frame_output::ComposedFrame { frame, graphics })
     }
 }
 

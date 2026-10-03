@@ -148,4 +148,4 @@ base64 の ANSI データを含む `terminal.frame` を改行区切り JSON で�
 herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 ```
 
-同じフレームを出力し、標準入力から改行区切り JSON コマンドを読み取ります。`terminal.input` はテキストまたは base64 データ、`terminal.resize` は表示サイズ、`terminal.scroll` はビューポートのスクロール、`terminal.release` はコントローラーの終了を扱います。入力とリサイズを所有できるコントローラーは 1 つだけです。
+同じフレームを出力し、標準入力から改行区切り JSON コマンドを読み取ります。`terminal.input` はテキストまたは base64 データ、`terminal.resize` は表示サイズ、`terminal.scroll` はビューポートのスクロール、`terminal.mouse` はマウス報告を有効にしたアプリへのセル位置のマウスイベント、`terminal.release` はコントローラーの終了を扱います。入力とリサイズを所有できるコントローラーは 1 つだけです。

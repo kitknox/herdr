@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+## [0.9.3] - 2026-09-29
+
+This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.2
+
+### Fixed
+- Terminal shortcuts that send Escape followed by a key work again in panes. On macOS, Option+Left/Right and Option+Backspace from Ghostty's defaults or iTerm2's Natural Text Editing preset move and delete by word again, instead of typing `b` and `f` or deleting one character. Escape-based Shift+Enter bindings insert a newline in Claude Code instead of submitting. Clicking a pane still doesn't send a stray Escape. (#4751)
+- Alt+[ followed quickly by another key no longer merges into a different key. (#4751)
+
+## [0.9.2] - 2026-09-29
+
+### Breaking Changes
+- The Herdr-specific pane graphics API is gone. `pane.graphics.info`, `set`, `clear`, and `stream` now return `unknown_method`. Apps show images by writing standard Kitty graphics to their terminal, which Herdr renders natively. (#4561)
+
+### Added
+- Agents can report their own resume command. Herdr then reopens their exact session after a server restart, with no built-in integration needed. Self-reported agents are also cleared once their pane is back at an idle shell. The new [Add Herdr support to your agent](https://herdr.dev/docs/add-herdr-support/) guide covers state, resume, and release for agent authors. (#4687)
+- Use more than one prefix key: `prefix = ["ctrl+space", "ctrl+s"]`. Every entry enters the same prefix mode, and `prefix+?` lists them all. (#4653, thanks @JJLiebig)
+- Go To shows every agent and terminal as its own row, grouped by workspace, with its status and path. Left and Right jump between workspaces. (#4384)
+- Bind `keys.clear_pane` to clear the focused pane's screen and scrollback while keeping the current prompt line. It is unbound by default and leaves full-screen apps such as Vim alone. (#4383)
+- `herdr machine status` checks saved machines without prompting. `herdr machine reconnect` finishes SSH authentication, including MFA, in your terminal. Open clients recheck failed machines every 30 seconds, so no restart is needed after fixing a connection. (#3763)
+- Interactive `machine add` finds the Herdr sessions already running on the host and lets you pick one. `--label` is optional; the machine is named after its SSH host. (#4204, #4678, thanks @JJLiebig and @dhh)
+- `terminal session control` accepts `terminal.mouse` events, so bridge clients can click buttons in apps that enable mouse reporting. (#4685)
+- Restored agents start one at a time, 100 ms apart by default, instead of all at once. Change the spacing with `[session] startup_per_agent_delay_ms`. (#4102, thanks @JJLiebig)
+
+### Changed
+- Images render faster and more reliably. Local Ghostty receives image data through temporary files instead of terminal output. Popups and notifications crop images around themselves instead of hiding them. Images that scroll out of view stay loaded, so scrolling back no longer resends them. (#4561, #4652, #4686)
+- SSH connections request compression. On slow links, remote panes catch up after scrolling in a fraction of the time. (#4340)
+- Scrolling output on saved machines sends only the rows that changed, cutting bandwidth for build logs and streaming agents. Older clients and servers keep working with the previous format. (#4711)
+- New panes set `TERM_PROGRAM=herdr` and `TERM_PROGRAM_VERSION`. They no longer inherit terminal session IDs, such as iTerm2's, or Claude Code session markers from the terminal that started the server. (#4104)
+- Windows panes default to PowerShell 7 (`pwsh`) when it is installed, falling back to Windows PowerShell. An explicit `default_shell` still wins. (#4297, thanks @JJLiebig)
+- Closing the last tab of a workspace now asks for confirmation. (#4379, #4409, thanks @minatoaquaMK2)
+- Event subscriptions deliver bursts in full. A reader that falls too far behind now gets an `events_lost` error instead of silently skipping events. (#4178, #4225, thanks @minatoaquaMK2)
+- On Unix, sending `SIGWINCH` to a Herdr client re-reads the host terminal's colors, so theme switchers that change colors without a light/dark notification can refresh panes. (#4349, thanks @dhh)
+
+### Fixed
+- Saved layouts survive host shutdown and failed restores. On Linux with logind, Herdr saves before the system shuts down. Every platform keeps up to 48 layout snapshots in `session-snapshots/` for manual recovery. (#4320)
+- Clicking a pane no longer sends a stray Escape that interrupts a working agent. (#3480)
+- An agent's first task now counts as done, even when it started with a prompt. Startup, restored sessions, and Pi's `/new` no longer fire false done notifications. Hook-reported status survives live handoff. (#3338, #3990, #3916)
+- The server uses far less CPU with many populated panes. The navigator, pane splits, and named targets stay fast in large sessions, and bursts of external events no longer stall rendering. (#4506, #4546, #4426, #4669, #4670, #4671, #4672, thanks @JJLiebig and @minatoaquaMK2)
+- Apps that use synchronized output no longer show torn frames while you type. The cursor no longer flickers during status redraws or jumps around an idle Codex on Windows. (#2968, #4303, thanks @JJLiebig)
+- The API socket keeps accepting connections after a transient error, so CLI commands and live handoff no longer fail while the server keeps running. (#4601)
+- Slow Git operations during worktree lookups no longer freeze typing. (#4492, thanks @JJLiebig)
+- `worktree open` no longer takes over the repository's own workspace, so removing the worktree no longer closes it. (#4293)
+- Forwarded SSH agents keep working in remote panes after a reconnect. Repeated `--machine` commands open far fewer SSH connections. (#1931, #4252)
+- OpenCode V1 panes stay working or blocked while their subagents run. An existing registration in `tui.json` is respected instead of regenerating `tui.jsonc`. (#1362, #4240)
+- Codex is no longer reported idle during active output, its mention popups are recognized, and remapped interrupt keys no longer break detection. (#4507, #4196, thanks @JJLiebig and @unmanbearpig)
+- Kiro approval prompts are reported as blocked. Grok idle panes settle with custom or disabled OSC titles. (#4203, #4372, #4333, thanks @vinayshah1998)
+- Droid's scrollback clears are honored, so its welcome header and old transcript no longer repeat. (#4432, thanks @factory-ain3sh)
+- Copy mode stays active while output continues and a movement key is held. (#3812, #4281, thanks @marcomayer)
+- Ctrl+Shift+letter keeps Shift in panes that have not enabled enhanced keyboard input, so Ctrl+Shift+C no longer arrives as Ctrl+C. (#4581, #4597, thanks @factory-ain3sh)
+- Mouse reports split across reads no longer leak into the shell after a focus switch over SSH. (#4630)
+- Windows: multi-line pastes into Claude Code no longer submit at the first newline, and Shift+Enter is preserved. Mouse capture survives focus changes and resizes, Ctrl+Win no longer opens prefix mode with a `ctrl+space` prefix, and remote clipboard image paste works again. (#4251, #4284, #4470, #4314, thanks @JJLiebig)
+- Windows: npm-installed OMP and agents launched through hardened runtimes are detected. `machine add` against a Windows host no longer fails as "not ready for saved machines." (#4313, #4579, #4309, thanks @JJLiebig)
+- The navigate-mode workspace highlight is visible with `theme = "terminal"`. Session navigator search matches words independently. The sidebar reveals agents selected by cycling or shortcuts. (#4300, #4408, #4273, #4535, #4355, thanks @minatoaquaMK2)
+- `session attach` without a terminal explains the problem instead of leaving a new session running. (#4393)
+- Socket error responses keep the original request ID, including subscription setup errors. (#4344)
+- `plugin install` accepts options before the repository. (#4446)
+- Windows panes pick up the host terminal's light or dark colors from the start, so apps no longer default to dark mode inside a light terminal. (#1530, #4369)
+- After `herdr update`, Herdr lists which running servers are still on the old version, with the exact commands to restart each one, and reminds you to update your saved SSH machines.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

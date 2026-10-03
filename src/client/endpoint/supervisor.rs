@@ -210,7 +210,13 @@ impl EndpointSupervisors {
                 state.online_since.get_or_insert(now);
                 state.next_attempt = None;
             }
-            ClientEndpointStatus::Attention | ClientEndpointStatus::Disabled => {
+            ClientEndpointStatus::Attention => {
+                state.online_since = None;
+                // Authentication or configuration may be repaired outside this client.
+                state.next_attempt =
+                    (!endpoint_id.is_local()).then_some(now + Duration::from_secs(30));
+            }
+            ClientEndpointStatus::Disabled => {
                 state.online_since = None;
                 state.next_attempt = None;
             }
@@ -278,11 +284,11 @@ fn connect_once(
             (stream, Box::new(()))
         }
         ConnectTarget::Ssh(profile) => {
-            let connected = crate::remote::connect_saved_ssh(profile.id.as_str(), &profile.target, &profile.session).map_err(|error| {
-                if failure_needs_attention(&error) {
-                    std::io::Error::new(error.kind(), format!("{error}. Run `{}` interactively to approve setup, then restart this client", crate::remote::saved_ssh_bootstrap_command(&profile.target, &profile.session)))
-                } else { error }
-            })?;
+            let connected = crate::remote::connect_saved_ssh(
+                profile.id.as_str(),
+                &profile.target,
+                &profile.session,
+            )?;
             (connected.stream, Box::new(connected.bridge))
         }
     };
@@ -297,6 +303,7 @@ fn connect_once(
         options.endpoint_keybindings,
         options.mouse_capture,
         false,
+        matches!(target, ConnectTarget::Local(_)),
     )
     .map_err(handshake_error)?;
     if handshake.encoding != RenderEncoding::SemanticFrame {
@@ -517,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_recovery_rejects_stale_generations_and_stops_retries_for_attention() {
+    fn ssh_recovery_rejects_stale_generations_and_rechecks_attention() {
         let now = Instant::now();
         let mut supervisors = EndpointSupervisors::new(&[profile()], now);
         let endpoint_id = ClientEndpointId::Ssh(profile().id);
@@ -535,6 +542,9 @@ mod tests {
             Some(now + INITIAL_RETRY_DELAY)
         );
         assert!(supervisors.record_status(&endpoint_id, 4, ClientEndpointStatus::Attention, now));
-        assert!(supervisors.endpoints[&endpoint_id].next_attempt.is_none());
+        assert_eq!(
+            supervisors.endpoints[&endpoint_id].next_attempt,
+            Some(now + Duration::from_secs(30))
+        );
     }
 }

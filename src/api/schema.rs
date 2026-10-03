@@ -55,6 +55,8 @@ pub enum Method {
     ServerLiveHandoff(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
+    #[serde(rename = "server.ssh_agent.register")]
+    ServerSshAgentRegister(ServerSshAgentRegisterParams),
     #[serde(rename = "server.agent_manifests")]
     ServerAgentManifests(EmptyParams),
     #[serde(rename = "server.reload_agent_manifests")]
@@ -167,6 +169,8 @@ pub enum Method {
     PaneResize(PaneResizeParams),
     #[serde(rename = "pane.scroll")]
     PaneScroll(PaneScrollParams),
+    #[serde(rename = "pane.clear")]
+    PaneClear(PaneTarget),
     #[serde(rename = "pane.edit_scrollback")]
     PaneEditScrollback(PaneTarget),
     #[serde(rename = "pane.selection.read")]
@@ -199,27 +203,6 @@ pub enum Method {
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
-    #[serde(rename = "pane.graphics.set")]
-    PaneGraphicsSet(PaneGraphicsSetParams),
-    #[serde(rename = "pane.graphics.clear")]
-    PaneGraphicsClear(PaneGraphicsClearParams),
-    #[serde(rename = "pane.graphics.info")]
-    PaneGraphicsInfo(PaneTarget),
-    #[serde(rename = "pane.graphics.stream")]
-    #[schemars(skip)]
-    PaneGraphicsStream(PaneGraphicsStreamParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamSet(PaneGraphicsSetParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamDirect(PaneGraphicsDirectParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamOpen(PaneGraphicsStreamParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamClose(PaneGraphicsStreamParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]

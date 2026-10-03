@@ -29,7 +29,6 @@ fn public_move(
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
         control: None,
     });
     let response = response_rx.recv().expect("pane move response");
@@ -56,7 +55,7 @@ async fn public_pane_move_focus_follows_the_moved_pane() {
     let source_id = server.app.public_pane_id(0, source).unwrap();
     let destination_id = server.app.public_workspace_id(1);
     let (control_rx, render_rx) = connect_test_shell(&mut server, 9, 80, 23);
-    let initial = client_shell_snapshot(read_server_message(control_rx.recv().unwrap()));
+    let initial = client_shell_snapshot(&control_rx);
 
     let moved = public_move(
         &mut server,
@@ -82,7 +81,7 @@ async fn public_pane_move_focus_follows_the_moved_pane() {
     assert_eq!(location.focused_tab_id(), Some(moved.pane.tab_id.as_str()));
 
     server.render_and_stream();
-    let snapshot = client_shell_snapshot(read_server_message(control_rx.recv().unwrap()));
+    let snapshot = client_shell_snapshot(&control_rx);
     assert!(snapshot.revision > initial.revision);
     assert_eq!(
         snapshot.focused_workspace_id.as_deref(),

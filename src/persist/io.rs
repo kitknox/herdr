@@ -198,6 +198,7 @@ mod tests {
     fn history_snapshot(secret: &str) -> SessionHistorySnapshot {
         SessionHistorySnapshot {
             version: SNAPSHOT_VERSION,
+            layout_fingerprint: None,
             workspaces: vec![WorkspaceHistorySnapshot {
                 tabs: vec![TabHistorySnapshot {
                     panes: std::collections::HashMap::from([(

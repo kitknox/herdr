@@ -26,20 +26,31 @@ impl SessionWriter {
         Ok(())
     }
 
+    fn preserve_snapshot_history(&self) {
+        if let Err(err) = preserve_snapshot_history(&self.path) {
+            tracing::warn!(
+                event = "persist.snapshot", outcome = "error", path = %self.path.display(),
+                err = %err, "failed to preserve session snapshot"
+            );
+        }
+    }
+
     pub(crate) fn save(
         &mut self,
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
-        let result = self
-            .preserve_unloaded()
-            .and_then(|()| super::io::save_to_path(&self.path, snapshot));
+        let result = self.preserve_unloaded().and_then(|()| {
+            self.preserve_snapshot_history();
+            super::io::save_to_path(&self.path, snapshot)
+        });
         if let Err(err) = result {
             crate::logging::session_save_failed(&self.path, &err.to_string());
             return;
         }
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
+        self.preserve_snapshot_history();
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::save_history_to_path(&history_path, history) {
             crate::logging::session_save_failed(&history_path, &err.to_string());
@@ -48,9 +59,10 @@ impl SessionWriter {
     }
 
     pub(crate) fn clear(&mut self) {
-        let result = self
-            .preserve_unloaded()
-            .and_then(|()| super::io::clear_path(&self.path));
+        let result = self.preserve_unloaded().and_then(|()| {
+            self.preserve_snapshot_history();
+            super::io::clear_path(&self.path)
+        });
         if let Err(err) = result {
             crate::logging::session_clear_failed(&self.path, &err.to_string());
             return;
@@ -63,7 +75,55 @@ impl SessionWriter {
     }
 }
 
+const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const SNAPSHOT_LIMIT: usize = 48;
+
+fn preserve_snapshot_history(path: &Path) -> io::Result<()> {
+    let directory = path.with_file_name("session-snapshots");
+    let existing = match recovery_files(&directory) {
+        Ok(files) => files,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    if let Some((_, latest)) = existing.last() {
+        let modified = std::fs::metadata(latest)?.modified()?;
+        if SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age < SNAPSHOT_INTERVAL)
+        {
+            return Ok(());
+        }
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(&bytes) else {
+        return Ok(());
+    };
+    if snapshot.version > super::snapshot::SNAPSHOT_VERSION || snapshot.workspaces.is_empty() {
+        return Ok(());
+    }
+    if let Some((_, latest)) = existing.last() {
+        let previous_bytes = std::fs::read(latest)?;
+        if let Ok(previous) = serde_json::from_slice::<SessionSnapshot>(&previous_bytes) {
+            if super::snapshot::layout_fingerprint(&snapshot).is_some_and(|fingerprint| {
+                super::snapshot::layout_fingerprint(&previous).as_ref() == Some(&fingerprint)
+            }) {
+                return Ok(());
+            }
+        }
+    }
+    preserve_existing_in(path, "session-snapshots", SNAPSHOT_LIMIT)?;
+    Ok(())
+}
+
 fn preserve_existing(path: &Path) -> io::Result<bool> {
+    preserve_existing_in(path, "session-backups", 3)
+}
+
+fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::Result<bool> {
     let mut source = match File::open(path) {
         Ok(file) => file,
         // Recheck on the next mutation until a fresh session is actually saved.
@@ -73,7 +133,7 @@ fn preserve_existing(path: &Path) -> io::Result<bool> {
     if !source.metadata()?.is_file() {
         return Err(io::Error::other("session path is not a regular file"));
     }
-    let directory = path.with_file_name("session-backups");
+    let directory = path.with_file_name(directory_name);
     std::fs::create_dir_all(&directory)?;
     let older = recovery_files(&directory)?;
     let now = SystemTime::now()
@@ -105,9 +165,13 @@ fn preserve_existing(path: &Path) -> io::Result<bool> {
             outcome = "ok",
             path = %path.display(),
             backup_path = %backup.display(),
-            "preserved unloaded session before replacement"
+            "preserved session recovery copy"
         );
-        if let Err(err) = prune_backups(&older) {
+        if let Err(err) = prune_backups(&older, keep) {
+            if directory_name == "session-snapshots" {
+                std::fs::remove_file(&backup)?;
+                return Err(err);
+            }
             tracing::warn!(
                 event = "persist.backup", subsystem = "persist", outcome = "prune_error",
                 path = %directory.display(), err = %err, "failed to prune session recovery copies"
@@ -168,10 +232,23 @@ fn recovery_files(directory: &Path) -> io::Result<Vec<(u128, PathBuf)>> {
     Ok(files)
 }
 
-fn prune_backups(older: &[(u128, PathBuf)]) -> io::Result<()> {
+fn prune_backups(older: &[(u128, PathBuf)], keep: usize) -> io::Result<()> {
     // The new copy is durable before any of the previous copies are removed.
-    for (_, path) in older.iter().take(older.len().saturating_sub(2)) {
-        std::fs::remove_file(path)?;
+    let mut remaining = older.len().saturating_sub(keep.saturating_sub(1));
+    let mut failure = None;
+    for (_, path) in older {
+        if remaining == 0 {
+            return Ok(());
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => remaining -= 1,
+            Err(err) => failure = Some(err),
+        }
+    }
+    if remaining > 0 {
+        if let Some(err) = failure {
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -232,6 +309,144 @@ mod tests {
             .into_iter()
             .map(|path| std::fs::read(path).unwrap())
             .collect()
+    }
+
+    fn snapshots(writer: &SessionWriter) -> Vec<(u128, PathBuf)> {
+        recovery_files(&writer.path.with_file_name("session-snapshots")).unwrap()
+    }
+
+    #[test]
+    fn snapshot_survives_exit_bursts_clears_and_writer_restarts() {
+        let mut writer = writer(false);
+        let original = snapshot();
+        writer.save(&original, None);
+        let files = snapshots(&writer);
+        assert_eq!(files.len(), 1);
+        let saved = std::fs::read(&files[0].1).unwrap();
+        for i in 0..100 {
+            let mut shrinking = snapshot();
+            shrinking.workspaces[0].custom_name = Some(format!("remaining pane {i}"));
+            writer.save(&shrinking, None);
+            writer = SessionWriter {
+                path: writer.path.clone(),
+                protect_unloaded: false,
+            };
+        }
+        writer.clear();
+        assert!(
+            !writer.path.exists(),
+            "intentional clear must still persist"
+        );
+        assert_eq!(snapshots(&writer), files);
+        assert_eq!(std::fs::read(&files[0].1).unwrap(), saved);
+        assert!(backups(&writer).is_empty());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_history_is_bounded_and_does_not_rotate_identical_layouts() {
+        let mut writer = writer(false);
+        let directory = writer.path.with_file_name("session-snapshots");
+        std::fs::create_dir(&directory).unwrap();
+        let manual = directory.join("my-layout.json");
+        std::fs::write(&manual, b"manual").unwrap();
+        for i in 0..SNAPSHOT_LIMIT {
+            std::fs::write(
+                directory.join(format!("session-{i:039}-1-0.json")),
+                b"old snapshot",
+            )
+            .unwrap();
+        }
+        for (_, path) in snapshots(&writer) {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+                .unwrap();
+        }
+        writer.save(&snapshot(), None);
+        assert_eq!(snapshots(&writer).len(), SNAPSHOT_LIMIT);
+        assert!(!directory
+            .join(format!("session-{:039}-1-0.json", 0))
+            .exists());
+        assert!(manual.exists());
+
+        for (_, path) in snapshots(&writer) {
+            std::fs::remove_file(path).unwrap();
+        }
+        let old = directory.join(format!("session-{:039}-1-0.json", 1));
+        let saved = std::fs::read(&writer.path).unwrap();
+        let reordered: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        let equivalent = serde_json::to_vec(&reordered).unwrap();
+        assert_ne!(saved, equivalent);
+        std::fs::write(&old, equivalent).unwrap();
+        File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        writer.save(&snapshot(), None);
+        assert_eq!(snapshots(&writer), vec![(1, old)]);
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_cadence_recovers_after_clock_rollback_and_restart() {
+        let mut writer = writer(false);
+        writer.save(&snapshot(), None);
+        let file = snapshots(&writer).pop().unwrap().1;
+        File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() + std::time::Duration::from_secs(86400)),
+            )
+            .unwrap();
+        let mut changed = snapshot();
+        changed.workspaces[0].custom_name = Some("after clock rollback".into());
+        writer.save(&changed, None);
+        assert_eq!(snapshots(&writer).len(), 2);
+        writer = SessionWriter {
+            path: writer.path.clone(),
+            protect_unloaded: false,
+        };
+        changed.workspaces[0].custom_name = Some("after restart".into());
+        writer.save(&changed, None);
+        assert_eq!(
+            snapshots(&writer).len(),
+            2,
+            "new mtime restores cadence across restart"
+        );
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pruning_continues_past_an_undeletable_entry() {
+        let writer = writer(false);
+        let locked = writer.path.with_file_name("undeletable");
+        std::fs::create_dir(&locked).unwrap();
+        let removable = writer.path.with_file_name("removable");
+        std::fs::write(&removable, b"old").unwrap();
+        assert!(prune_backups(&[(1, locked.clone()), (2, removable.clone())], 2).is_ok());
+        assert!(locked.exists());
+        assert!(!removable.exists());
+        assert!(prune_backups(&[(1, locked)], 1).is_err());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_failure_does_not_block_primary_save_and_clear() {
+        let mut writer = writer(false);
+        std::fs::write(writer.path.with_file_name("session-snapshots"), b"blocked").unwrap();
+        writer.save(&snapshot(), None);
+        assert!(writer.path.exists());
+        writer.clear();
+        assert!(!writer.path.exists());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
     }
 
     #[test]

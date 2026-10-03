@@ -155,5 +155,6 @@ herdr terminal session control w1:p1 --takeover --cols 120 --rows 40
 Control mode prints the same newline-delimited frame records and reads
 newline-delimited JSON commands on stdin. `terminal.input` sends text or
 base64 bytes, `terminal.resize` changes the controller viewport,
-`terminal.scroll` scrolls the attached viewport, and `terminal.release` closes
-the controller. Only one controller owns input and resize at a time.
+`terminal.scroll` scrolls the attached viewport, `terminal.mouse` sends a mouse
+event at a cell to applications that enabled mouse reporting, and
+`terminal.release` closes the controller. Only one controller owns input and resize at a time.
