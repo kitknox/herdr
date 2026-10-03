@@ -3292,6 +3292,13 @@ impl PaneRuntime {
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let result = self.terminal.clear_screen();
         self.content_seq.fetch_add(1, Ordering::Release);
+        if result.is_ok() && self.raw_taps.has_taps() {
+            // The clear writes no PTY output, so raw clients would keep
+            // showing what it removed.
+            self.raw_taps.resnapshot_armed(|seq, history_limit_bytes| {
+                self.raw_snapshot_locked(seq, history_limit_bytes)
+            });
+        }
         drop(guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
@@ -3634,9 +3641,10 @@ impl PaneRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        self.raw_taps.send_snapshot(attach_id, |seq| {
-            self.raw_snapshot_locked(seq, history_limit_bytes)
-        })
+        self.raw_taps
+            .send_snapshot(attach_id, history_limit_bytes, |seq| {
+                self.raw_snapshot_locked(seq, history_limit_bytes)
+            })
     }
 
     pub(crate) fn detach_raw(
@@ -4084,6 +4092,51 @@ mod tests {
             .text
             .contains("one"));
         assert!(runtime.visible_text().contains("five"));
+    }
+
+    #[tokio::test]
+    async fn clear_pane_resnapshots_armed_raw_taps() {
+        use crate::api::control::ControlOutbound;
+
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 5, b"old\r\nold\r\n$ ");
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-0".into(),
+            tx.clone(),
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            2,
+        );
+        let (unarmed_tx, unarmed_rx) = std::sync::mpsc::channel();
+        runtime.attach_raw(
+            "1-1".into(),
+            unarmed_tx,
+            Arc::new(RawTapBudget::new(1 << 20)),
+            true,
+            2,
+        );
+        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        runtime.test_process_pty_bytes(b"typed");
+        let _ = rx.try_iter().count();
+
+        runtime.clear_screen().unwrap();
+        match rx.try_iter().collect::<Vec<_>>().as_slice() {
+            [ControlOutbound::Snapshot {
+                attach_id,
+                snapshot,
+            }] => {
+                assert_eq!(attach_id, "1-0");
+                assert_eq!(snapshot.seq, 1, "stamped after the streamed output");
+                let primary = snapshot.primary.as_deref().unwrap_or_default();
+                assert!(primary.contains("$ typed"), "snapshot: {primary:?}");
+                assert!(!primary.contains("old"), "snapshot: {primary:?}");
+            }
+            other => panic!("expected one snapshot after clear, got {other:?}"),
+        }
+        assert!(
+            unarmed_rx.try_recv().is_err(),
+            "a tap awaiting its first snapshot stays silent"
+        );
     }
 
     #[tokio::test]

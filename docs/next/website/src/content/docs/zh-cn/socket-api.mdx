@@ -674,7 +674,7 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 `terminal.attach` 接受窗格 ID、终端 ID 或代理名称,并像直接附加一样让控制流成为该终端的可写拥有者;传入 `takeover: true` 可驱逐其他拥有者。响应携带 `attach_id`,它的第一条记录是 `terminal.snapshot`:活动屏幕的 ANSI(带取消软换行回滚的 `primary`,或 `alternate`)、包含恢复终端状态所需序列(模式、滚动区域、制表位、字符集、当前画笔属性,以及包括已压入的 Kitty 栈在内的键盘协议)的 `state_ansi`、仅包含当前画笔属性的 `pen_ansi`、光标,以及以字段形式给出相同事实的 `state` 对象。打印后停留在最后一列的光标会报告 `pending_wrap` 和 `pending_wrap_cell`,后者是要从该位置重新打印的带样式单元格,使客户端终端像服务器一样换行下一个字符。PTY 读取中途截断的转义序列会紧随快照之后作为第一条 `terminal.output` 记录发送,因此客户端能够完整解析。快照在窗格的输出锁下获取,因此 `seq` 更大的每条 `terminal.output` 记录都产生于其后。`history_limit_bytes` 限制主屏幕历史(默认 1 MiB,最大 8 MiB),`truncated` 报告是否发生截断。备用屏幕处于活动状态时只捕获该屏幕。
 
-`terminal.output` 以 base64 携带原始 PTY 字节,并带有每个附加独立的 `seq`。客户端落后时,服务器会丢弃输出并发送 `terminal.gap`;请求 `terminal.snapshot` 重新同步,它会发出带当前 `seq` 的新 `terminal.snapshot`。`terminal.input` 把字节原样写入 PTY,包括括号粘贴包装以及客户端模拟器产生的鼠标或焦点报告。`terminal.detached` 报告 `takeover` 或 `closed`。记录结构在捆绑的 schema 的 `schemas.control_record` 下。
+`terminal.output` 以 base64 携带原始 PTY 字节,并带有每个附加独立的 `seq`。客户端落后时,服务器会丢弃输出并发送 `terminal.gap`;请求 `terminal.snapshot` 重新同步,它会发出带当前 `seq` 的新 `terminal.snapshot`。当服务器在没有 PTY 输出的情况下改变屏幕(例如 `pane.clear`)时,也会主动推送 `terminal.snapshot`。`terminal.input` 把字节原样写入 PTY,包括括号粘贴包装以及客户端模拟器产生的鼠标或焦点报告。`terminal.detached` 报告 `takeover` 或 `closed`。记录结构在捆绑的 schema 的 `schemas.control_record` 下。
 
 `answer_queries` 决定由哪个模拟器应答设备属性、XTGETTCAP 和 OSC 颜色查询。使用 `client`(默认)时,在附加拥有终端期间 Herdr 会抑制自己的应答,因此恰好只有一个模拟器应答;使用 `server` 时 Herdr 照常应答。
 

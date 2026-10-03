@@ -915,7 +915,9 @@ alternate screen is active only that screen is captured.
 `terminal.output` carries raw PTY bytes as base64 with a per-attach `seq`. When
 a client falls behind, the server drops output and sends `terminal.gap`;
 request `terminal.snapshot` to resynchronize, which emits a fresh
-`terminal.snapshot` stamped with the current `seq`. `terminal.input` writes
+`terminal.snapshot` stamped with the current `seq`. The server also pushes an
+unrequested `terminal.snapshot` when it changes the screen without PTY output,
+such as `pane.clear`. `terminal.input` writes
 bytes to the PTY verbatim, including bracketed-paste wrappers and the mouse or
 focus reports the client's emulator produced. Replies the client's emulator
 generates on its own (device attributes, cursor position, colour queries)

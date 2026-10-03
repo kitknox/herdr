@@ -97,6 +97,9 @@ struct RawTap {
     /// Control protocol of the owning connection; authority records go
     /// only to protocol 2 and later.
     protocol: u32,
+    /// History the client asked for with its last snapshot; snapshots the
+    /// server starts on its own reuse it.
+    history_limit_bytes: usize,
 }
 
 impl RawTap {
@@ -240,6 +243,7 @@ impl RawTapRegistry {
             suppress_responses,
             is_authority: None,
             protocol,
+            history_limit_bytes: 0,
         };
         if let Ok(mut taps) = self.taps.lock() {
             taps.push(tap);
@@ -285,6 +289,7 @@ impl RawTapRegistry {
     pub(crate) fn send_snapshot(
         &self,
         attach_id: &str,
+        history_limit_bytes: usize,
         snapshot: impl FnOnce(u64) -> Option<TerminalSnapshot>,
     ) -> bool {
         let Ok(mut taps) = self.taps.lock() else {
@@ -294,6 +299,7 @@ impl RawTapRegistry {
             return false;
         };
         tap.dropped = 0;
+        tap.history_limit_bytes = history_limit_bytes;
         match snapshot(tap.seq) {
             Some(snapshot) => {
                 tap.armed = true;
@@ -309,6 +315,33 @@ impl RawTapRegistry {
                 sent
             }
             None => false,
+        }
+    }
+
+    /// Emit a fresh snapshot on every armed tap, for screen changes no PTY
+    /// output describes. Each uses the history its client last asked for.
+    /// Call with the content write lock held.
+    pub(crate) fn resnapshot_armed(
+        &self,
+        snapshot: impl Fn(u64, usize) -> Option<TerminalSnapshot>,
+    ) {
+        let Ok(mut taps) = self.taps.lock() else {
+            return;
+        };
+        let pending = self
+            .pending_tail
+            .lock()
+            .map(|pending| pending.clone())
+            .unwrap_or_default();
+        for tap in taps.iter_mut().filter(|tap| tap.armed) {
+            let Some(snapshot) = snapshot(tap.seq, tap.history_limit_bytes) else {
+                continue;
+            };
+            tap.dropped = 0;
+            tap.send_snapshot(snapshot);
+            if !pending.is_empty() {
+                tap.publish(&pending);
+            }
         }
     }
 
@@ -466,7 +499,7 @@ mod tests {
         attach_id: &str,
         rx: &std::sync::mpsc::Receiver<ControlOutbound>,
     ) {
-        assert!(registry.send_snapshot(attach_id, |seq| Some(snapshot(seq))));
+        assert!(registry.send_snapshot(attach_id, 1 << 20, |seq| Some(snapshot(seq))));
         assert!(matches!(
             rx.try_recv(),
             Ok(ControlOutbound::Snapshot { .. })
