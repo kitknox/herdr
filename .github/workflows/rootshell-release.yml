@@ -141,13 +141,11 @@ jobs:
           prerelease: true
           generate_release_notes: true
           body: |
-            Rootshell v0.1.7 adds independent terminal grids for panes in control mode. With a compatible Rootshell client, changing one pane's font size resizes its terminal grid to fill its slot without changing the other panes' fonts.
+            Rootshell v0.1.8 updates the fork to Herdr v0.9.3 while preserving control mode, shared terminal attaches, geometry ownership, and independent pane grids (control protocol 3). See the upstream notes for [v0.9.2](https://github.com/herdrdev/herdr/releases/tag/v0.9.2) and [v0.9.3](https://github.com/herdrdev/herdr/releases/tag/v0.9.3).
 
-            Control protocol 3 advertises `pane_geometry`; protocol 1 and 2 clients remain supported. Shared viewing and geometry ownership are preserved. Invalid grids smaller than 4 columns or 2 rows are rejected before changing geometry or ownership.
+            Herdr's new `pane.clear` clears a pane without writing to it. Control clients now receive a fresh `terminal.snapshot` afterward, so their display matches the server.
 
-            Thanks to @dannyking (Danny King) for the client and server implementation, reported in https://github.com/kitknox/rootshell/issues/533. His original commits are preserved in both repositories. The companion Rootshell client change is being prepared for an upcoming app release.
-
-            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.7`.
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.8`.
 
             After installation completes, save work and restart existing servers: stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Reconnect Rootshell afterward. Existing servers keep running their previous binary until restarted. Experimental live handoff is not recommended for this release.
 
