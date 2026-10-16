@@ -162,6 +162,19 @@ impl ActiveSubscription {
             Subscription::TabGeometryChanged {} => {
                 Ok(event_subscription(EventKind::TabGeometryChanged))
             }
+            Subscription::AgentPrompted {} => Ok(event_subscription(EventKind::AgentPrompted)),
+            Subscription::AgentMessageSent {} => {
+                Ok(event_subscription(EventKind::AgentMessageSent))
+            }
+            Subscription::AgentMessageDelivered {} => {
+                Ok(event_subscription(EventKind::AgentMessageDelivered))
+            }
+            Subscription::AgentMessageFailed {} => {
+                Ok(event_subscription(EventKind::AgentMessageFailed))
+            }
+            Subscription::AgentMessageRead {} => {
+                Ok(event_subscription(EventKind::AgentMessageRead))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

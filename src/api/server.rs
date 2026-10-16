@@ -14,7 +14,9 @@ use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
-use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
+use crate::api::wait::{
+    prompt_agent, send_agent_message, wait_for_agent, wait_for_event, wait_for_output,
+};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
@@ -467,6 +469,17 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        Method::AgentMessageSend(params) => {
+            let response = send_agent_message(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                event_hub,
+                running,
+            )?;
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
@@ -640,6 +653,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentMessageSend(_) => "agent.message.send",
+        Method::AgentMessageList(_) => "agent.message.list",
+        Method::AgentMessageGet(_) => "agent.message.get",
+        Method::AgentMessageMarkRead(_) => "agent.message.mark_read",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -706,6 +723,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::TabSetGeometry(_) => "tab.set_geometry",
         Method::TabSetPaneGeometry(_) => "tab.set_pane_geometry",
         Method::TabClaimGeometry(_) => "tab.claim_geometry",
+        Method::TabReleaseGeometry(_) => "tab.release_geometry",
         Method::ControlList(_) => "control.list",
     }
 }
@@ -1154,6 +1172,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
                 target: "reviewer".into(),
                 text: "review this".into(),
                 wait: None,
+                caller: None,
             }),
         },
         &tx,

@@ -1377,7 +1377,8 @@ impl AppState {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
-            AppEvent::WorktreeRuntimeRestoreFailed { .. } => Vec::new(),
+            AppEvent::WorktreeRuntimeRestoreFailed { .. }
+            | AppEvent::AgentMessageSubmissionFailed { .. } => Vec::new(),
             AppEvent::UpdateReady {
                 version,
                 install_command,

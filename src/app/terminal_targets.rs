@@ -98,6 +98,22 @@ impl App {
             return Ok(resolved);
         }
 
+        let session_matches: Vec<_> = self
+            .terminal_targets()
+            .into_iter()
+            .filter(|candidate| {
+                self.state
+                    .terminals
+                    .values()
+                    .find(|terminal| terminal.id.to_string() == candidate.terminal_id)
+                    .and_then(super::creation::terminal_agent_session_info)
+                    .is_some_and(|session| session.value == target)
+            })
+            .collect();
+        if let Some(resolved) = self.single_terminal_match(target, session_matches)? {
+            return Ok(resolved);
+        }
+
         Err(TerminalTargetError::NotFound {
             target: target.to_string(),
         })

@@ -117,6 +117,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
+            caller: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -136,6 +137,7 @@ fn agent_start_and_prompt_requests_round_trip() {
                 timeout_ms: Some(120_000),
                 submission_deadline: None,
             }),
+            caller: None,
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
@@ -453,6 +455,16 @@ fn control_stream_requests_round_trip() {
     assert_eq!(params.tab_id.as_deref(), Some("w1:t1"));
     assert!(params.attach_id.is_none());
 
+    let release: Request = serde_json::from_str(
+        r#"{"id":"r","method":"tab.release_geometry","params":{"attach_id":"1-0"}}"#,
+    )
+    .unwrap();
+    let Method::TabReleaseGeometry(params) = &release.method else {
+        panic!("expected tab.release_geometry");
+    };
+    assert!(params.tab_id.is_none());
+    assert_eq!(params.attach_id.as_deref(), Some("1-0"));
+
     let list: Request =
         serde_json::from_str(r#"{"id":"l","method":"control.list","params":{}}"#).unwrap();
     assert!(matches!(list.method, Method::ControlList(_)));
@@ -506,6 +518,7 @@ fn control_records_use_dotted_type_tags() {
         attach_id: "1-0".into(),
         seq: 7,
         bytes: "aGk=".into(),
+        offset: None,
     };
     let json = serde_json::to_value(&output).unwrap();
     assert_eq!(json["type"], "terminal.output");

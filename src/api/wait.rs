@@ -176,7 +176,7 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    mut params: crate::api::schema::AgentPromptParams,
+    params: crate::api::schema::AgentPromptParams,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
@@ -192,35 +192,188 @@ pub(super) fn prompt_agent(
             None,
         )));
     };
+    let target = params.target.clone();
+    let success_id = request_id.clone();
+    wait_after_submission(
+        request_id,
+        target,
+        wait,
+        move |id, submission_deadline| {
+            let mut params = params;
+            if let Some(prompt_wait) = params.wait.as_mut() {
+                prompt_wait.submission_deadline = submission_deadline;
+            }
+            Request {
+                id,
+                method: Method::AgentPrompt(params),
+            }
+        },
+        |_, agent| agent_prompt_success(success_id.clone(), agent),
+        ServerWait {
+            stream,
+            api_tx,
+            event_hub,
+            running,
+        },
+    )
+}
 
-    let wait_started = std::time::Instant::now();
-    let before_prompt = match agent_get_for_prompt(
-        &request_id,
-        &params.target,
-        api_tx,
-        wait.timeout_ms,
-        wait_started,
-    ) {
-        Ok(agent) => agent,
-        Err(response) => {
-            return serde_json::to_string(&response)
-                .map(Some)
-                .map_err(std::io::Error::other);
-        }
+pub(super) fn send_agent_message(
+    request_id: String,
+    params: crate::api::schema::AgentMessageSendParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    let Some(wait) = params.wait.clone() else {
+        return Ok(Some(dispatch_to_app_with_timeout(
+            Request {
+                id: request_id,
+                method: Method::AgentMessageSend(params),
+            },
+            api_tx,
+            None,
+        )));
     };
+    let target = match params.target.clone() {
+        Some(target) => target,
+        None => match reply_target(&request_id, params.reply_to.as_deref(), api_tx) {
+            Ok(target) => target,
+            Err(response) => {
+                return serde_json::to_string(&response)
+                    .map(Some)
+                    .map_err(std::io::Error::other);
+            }
+        },
+    };
+    let success_id = request_id.clone();
+    wait_after_submission(
+        request_id,
+        target,
+        wait,
+        move |id, submission_deadline| {
+            let mut params = params;
+            if let Some(message_wait) = params.wait.as_mut() {
+                message_wait.submission_deadline = submission_deadline;
+            }
+            Request {
+                id,
+                method: Method::AgentMessageSend(params),
+            }
+        },
+        |submitted, agent| {
+            let message = serde_json::from_value(submitted["result"]["message"].clone())
+                .map_err(std::io::Error::other)?;
+            serde_json::to_string(&SuccessResponse {
+                id: success_id.clone(),
+                result: ResponseResult::AgentMessageSent {
+                    message,
+                    agent: Some(agent),
+                },
+            })
+            .map_err(std::io::Error::other)
+        },
+        ServerWait {
+            stream,
+            api_tx,
+            event_hub,
+            running,
+        },
+    )
+}
+
+fn reply_target(
+    request_id: &str,
+    reply_to: Option<&str>,
+    api_tx: &ApiRequestSender,
+) -> Result<String, ErrorResponse> {
+    let error = |code: &str, message: String| ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: code.into(),
+            message,
+        },
+    };
+    let Some(reply_to) = reply_to else {
+        return Err(error(
+            "invalid_request",
+            "agent message requires a target or reply_to".into(),
+        ));
+    };
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:reply_to"),
+            method: Method::AgentMessageGet(crate::api::schema::AgentMessageTarget {
+                id: reply_to.to_string(),
+            }),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|_| error("internal_error", "failed to decode message response".into()))?;
+    if let Some(body) = value.get("error") {
+        let body: ErrorBody = serde_json::from_value(body.clone())
+            .map_err(|_| error("internal_error", "failed to decode message error".into()))?;
+        return Err(ErrorResponse {
+            id: request_id.into(),
+            error: body,
+        });
+    }
+    let sender = &value["result"]["message"]["sender"];
+    sender["pane_id"]
+        .as_str()
+        .or_else(|| sender["agent_session_id"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            error(
+                "agent_not_found",
+                format!("message {reply_to} has no sender pane to reply to"),
+            )
+        })
+}
+
+struct ServerWait<'a> {
+    stream: &'a mut LocalStream,
+    api_tx: &'a ApiRequestSender,
+    event_hub: &'a EventHub,
+    running: &'a Arc<AtomicBool>,
+}
+
+/// Submits text to an agent, then waits for it to react and settle. A successful submission
+/// response without an `agent` (a queued message) is returned without waiting.
+fn wait_after_submission(
+    request_id: String,
+    target: String,
+    wait: crate::api::schema::AgentPromptWaitOptions,
+    build_request: impl FnOnce(String, Option<std::time::Instant>) -> Request,
+    finish: impl Fn(&serde_json::Value, crate::api::schema::AgentInfo) -> std::io::Result<String>,
+    server: ServerWait<'_>,
+) -> std::io::Result<Option<String>> {
+    let ServerWait {
+        stream,
+        api_tx,
+        event_hub,
+        running,
+    } = server;
+    let wait_started = std::time::Instant::now();
+    let before_prompt =
+        match agent_get_for_prompt(&request_id, &target, api_tx, wait.timeout_ms, wait_started) {
+            Ok(agent) => agent,
+            Err(response) => {
+                return serde_json::to_string(&response)
+                    .map(Some)
+                    .map_err(std::io::Error::other);
+            }
+        };
     let prompt_started_working =
         before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
-    let target = params.target.clone();
-    if let Some(prompt_wait) = params.wait.as_mut() {
-        prompt_wait.submission_deadline = wait
-            .timeout_ms
-            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
-    }
+    let submission_deadline = wait
+        .timeout_ms
+        .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
     let last_event_sequence = event_hub.current_sequence();
-    let prompt_request = Request {
-        id: request_id.clone(),
-        method: Method::AgentPrompt(params),
-    };
+    let prompt_request = build_request(request_id.clone(), submission_deadline);
     #[cfg(windows)]
     let prompt_response = dispatch_to_app_with_caller_timeout(
         prompt_request,
@@ -229,6 +382,11 @@ pub(super) fn prompt_agent(
     );
     #[cfg(not(windows))]
     let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
+    let submitted: serde_json::Value =
+        serde_json::from_str(&prompt_response).unwrap_or(serde_json::Value::Null);
+    if submitted.get("result").is_some() && submitted["result"]["agent"].is_null() {
+        return Ok(Some(prompt_response));
+    }
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
@@ -289,7 +447,7 @@ pub(super) fn prompt_agent(
         };
     }
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return finish(&submitted, initial).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -318,7 +476,7 @@ pub(super) fn prompt_agent(
         AgentWaitOutcome::Matched(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    finish(&submitted, agent).map(Some)
 }
 
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {

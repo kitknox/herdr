@@ -493,6 +493,7 @@ impl TerminalRuntime {
         budget: std::sync::Arc<crate::pane::raw_stream::RawTapBudget>,
         suppress_terminal_responses: bool,
         protocol: u32,
+        resume_bytes: usize,
     ) {
         self.0.attach_raw(
             attach_id,
@@ -500,6 +501,7 @@ impl TerminalRuntime {
             budget,
             suppress_terminal_responses,
             protocol,
+            resume_bytes,
         )
     }
 
@@ -507,8 +509,13 @@ impl TerminalRuntime {
         self.0.set_raw_query_authority(attach_id)
     }
 
-    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
-        self.0.snapshot_raw(attach_id, history_limit_bytes)
+    pub(crate) fn snapshot_raw(
+        &self,
+        attach_id: &str,
+        history_limit_bytes: usize,
+        resume: Option<crate::api::schema::TerminalResumePoint>,
+    ) -> bool {
+        self.0.snapshot_raw(attach_id, history_limit_bytes, resume)
     }
 
     pub(crate) fn detach_raw(

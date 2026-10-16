@@ -863,6 +863,7 @@ pub struct AppState {
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
     pub pane_scrollback_limit_bytes: usize,
+    pub control_resume_bytes: usize,
     pub sound: SoundConfig,
     pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
@@ -1088,6 +1089,7 @@ impl AppState {
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
+            control_resume_bytes: crate::config::DEFAULT_CONTROL_RESUME_BYTES,
             sound: SoundConfig {
                 enabled: false,
                 ..SoundConfig::default()

@@ -144,6 +144,12 @@ impl App {
                     context.tab_id = Some(layout.tab_id.clone());
                     context
                 }),
+            EventData::AgentMessageSent { message }
+            | EventData::AgentMessageDelivered { message }
+            | EventData::AgentMessageFailed { message }
+            | EventData::AgentMessageRead { message } => {
+                self.plugin_context_for_agent_message(message, correlation_id)
+            }
             EventData::PaneCreated { pane } | EventData::PaneUpdated { pane } => {
                 self.plugin_context_for_pane_info(pane, correlation_id)
             }
@@ -181,6 +187,11 @@ impl App {
                 pane_id,
                 workspace_id,
                 ..
+            }
+            | EventData::AgentPrompted {
+                pane_id,
+                workspace_id,
+                ..
             } => self
                 .plugin_context_for_public_pane_id(pane_id, correlation_id)
                 .or_else(|| self.plugin_context_for_workspace_id(workspace_id, correlation_id))
@@ -191,6 +202,20 @@ impl App {
                     context
                 }),
         }
+    }
+
+    fn plugin_context_for_agent_message(
+        &self,
+        message: &crate::api::schema::AgentMessage,
+        correlation_id: &str,
+    ) -> PluginInvocationContext {
+        self.plugin_context_for_public_pane_id(&message.target.pane_id, correlation_id)
+            .unwrap_or_else(|| {
+                let mut context = empty_plugin_context(correlation_id);
+                context.workspace_id = message.target.workspace_id.clone();
+                context.focused_pane_id = Some(message.target.pane_id.clone());
+                context
+            })
     }
 
     fn plugin_context_for_workspace_id(

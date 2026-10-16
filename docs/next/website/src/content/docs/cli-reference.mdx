@@ -336,11 +336,17 @@ Metadata text is normalized before storage. Herdr trims surrounding whitespace, 
 For the pane-versus-agent model and complete orchestration examples, see [Agent automation](/docs/agent-automation/).
 
 ```bash
-herdr agent list
+herdr agent list [--flat] [--project [PATH] | --workspace [PATH]]
 herdr agent get <target>
 herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
 herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
+herdr agent message send <target> (<text>|--file PATH|-) [--subject TEXT] [--reply-to MSG_ID] [--queue] [--wait] [--until STATUS]... [--timeout MS]
+herdr agent message reply <msg_id> (<text>|--file PATH|-) [--subject TEXT] [--queue] [--wait] [--until STATUS]... [--timeout MS]
+herdr agent message list [--pane PANE_ID] [--from PANE_ID] [--unread] [--thread MSG_ID] [--limit N]
+herdr agent message show <msg_id> [--mark-read]
+herdr agent message read <msg_id>
+herdr agent message last [--pane PANE_ID]
 herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
@@ -350,13 +356,25 @@ herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
 
-Agent targets are either a unique live agent name or the pane ID that currently hosts the agent. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
+Agent targets are either a unique live agent name or the pane ID that currently hosts the agent; `agent message send` also accepts an agent session id. Terminal IDs and bare agent-kind labels are not agent targets.
+
+`agent list` prints `agent_list_by_workspace`: one entry per workspace with live agents, in workspace order, each with `workspace_id`, `label`, and its `agents`. Every agent carries the identifiers prompts and messages accept (`pane_id`, `name`, `agent_session.value`) along with its kind (`agent`), `cwd`, `foreground_cwd`, and `agent_status`. `--flat` prints the unchanged `agent.list` response instead. `--project PATH` (alias `--workspace PATH`) keeps agents in that project, and `--project` without a path uses the caller's current directory. An agent's directory is its `foreground_cwd`, else its `cwd`; its project is the repository's main checkout, so a linked worktree counts as the checkout it was made from, or the directory itself outside a repository. Agents whose directory cannot be read belong to no project. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
 
 `agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `letta`, `maki`, and `muse`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 
 `agent prompt` honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
+
+`agent message` sends an attributed message. Herdr records the sender from the caller's `HERDR_PANE_ID`: its pane, workspace, tab, agent, agent session id, and working directory. Callers outside any pane are recorded as `cli` with their working directory. Each message gets an id such as `msg_01JD4X7Q2W8ZK3M5N6P9R0T1VB`. The text typed into the target starts with one header line, then an optional `Subject:` line, then the body:
+
+```text
+[herdr message msg_01JD4X7Q2W8ZK3M5N6P9R0T1VB from w2:p1 (claude, ~/projects/tropos) re msg_01JD4X5C9H2E4G6J8K0M1N3P5Q]
+```
+
+The header grammar is `[herdr message <id> from <sender> (<details>) re <parent>]`. `<sender>` is a pane id or `cli`. `(<details>)` lists the sender's agent and working directory, whichever are known, and is omitted when neither is. ` re <parent>` appears only on replies. Message targets accept pane ids, agent names, and agent session ids. `reply` and `--reply-to` thread a message under an earlier one and default the target to that message's sender. Delivery follows `agent prompt`: a `blocked` target returns `agent_blocked`, and `--wait`, `--until`, and `--timeout` behave the same way. With `--queue`, a message to a busy or blocked agent is stored with status `queued` and delivered when the agent next becomes `idle` or `done`, including after a server restart. A queued message whose pane closes becomes `failed` with reason `target_closed`. Statuses are `queued`, `delivered`, `failed` with a `failure` reason, and `read` once the receiver runs `agent message read` or `show --mark-read`.
+
+`list` and `last` default to the inbox of the caller's pane, matched by pane id or by the agent session that pane currently hosts. `list --thread` shows a whole thread across panes. `last` returns the newest delivered or read message for the pane, so an agent can find the sender of the text it just received without reading scrollback. Messages persist per Herdr session in `agent-messages.jsonl` next to `session.json`; the newest 2000 are kept.
 
 `idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 

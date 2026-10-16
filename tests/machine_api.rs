@@ -258,7 +258,7 @@ fn machine_api_profile_id_routes_large_list_responses() {
     );
     let response = success(
         harness
-            .command(&["--machine", PROFILE_ID, "agent", "list"])
+            .command(&["--machine", PROFILE_ID, "agent", "list", "--flat"])
             .output()
             .unwrap(),
     );
@@ -290,7 +290,7 @@ fn machine_api_bootstrap_falls_back_from_an_old_path_binary() {
     );
     success(
         harness
-            .command(&["--machine", "mac", "agent", "list"])
+            .command(&["--machine", "mac", "agent", "list", "--flat"])
             .env("TEST_MODE", "old")
             .output()
             .unwrap(),
@@ -311,7 +311,7 @@ fn machine_api_reuses_discovery_across_commands_without_rewriting_profiles() {
         );
         success(
             harness
-                .command(&["--machine", "mac", "agent", "list"])
+                .command(&["--machine", "mac", "agent", "list", "--flat"])
                 .output()
                 .unwrap(),
         );
@@ -406,7 +406,7 @@ fn machine_api_transient_connection_failure_keeps_working_metadata() {
     harness.warm_metadata();
     let before = harness.ssh_calls();
     let output = harness
-        .command(&["--machine", "mac", "agent", "list"])
+        .command(&["--machine", "mac", "agent", "list", "--flat"])
         .env("TEST_MODE", "offline")
         .output()
         .unwrap();
@@ -599,7 +599,7 @@ fn machine_api_rejects_old_bridges_and_disconnected_machines() {
     ] {
         let harness = Harness::new();
         let output = harness
-            .command(&["--machine", "mac", "agent", "list"])
+            .command(&["--machine", "mac", "agent", "list", "--flat"])
             .env("TEST_MODE", mode)
             .output()
             .unwrap();

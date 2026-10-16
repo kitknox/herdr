@@ -1471,6 +1471,12 @@
           "type": "integer",
           "default": "10000000",
           "description": "Maximum scrollback buffer size in bytes retained per pane terminal. The legacy key name `scrollback_lines` is accepted as an alias."
+        },
+        {
+          "key": "advanced.control_resume_bytes",
+          "type": "integer",
+          "default": "1048576",
+          "description": "Recent output in bytes each control-attached terminal keeps so a reconnecting control client can resume instead of taking a snapshot. Applies from the next attach; capped at 64 MiB."
         }
       ]
     },

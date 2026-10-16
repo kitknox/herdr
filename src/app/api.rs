@@ -5,6 +5,7 @@ mod agents;
 mod env;
 mod integrations;
 mod layouts;
+mod messages;
 mod panes;
 pub(crate) mod plugins;
 pub(super) mod responses;
@@ -92,6 +93,10 @@ impl App {
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
         let mut worktree_restore_failed = false;
         let ev = match ev {
+            AppEvent::AgentMessageSubmissionFailed { message_id, reason } => {
+                self.handle_agent_message_submission_failed(&message_id, reason);
+                return Vec::new();
+            }
             AppEvent::WorktreeRuntimeRestoreFailed {
                 pane_id,
                 operation_id,
@@ -765,7 +770,8 @@ impl App {
 
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
         self.run_plugin_event_hooks(&event);
-        self.event_hub.push(event);
+        self.event_hub.push(event.clone());
+        self.route_queued_agent_messages(&event);
     }
 
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
@@ -1099,6 +1105,22 @@ impl App {
                     "agent.prompt is handled asynchronously by the app runtime",
                 );
             }
+            Method::AgentMessageSend(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "agent.message.send is handled asynchronously by the app runtime",
+                );
+            }
+            Method::AgentMessageList(params) => {
+                return self.handle_agent_message_list(request.id, params)
+            }
+            Method::AgentMessageGet(target) => {
+                return self.handle_agent_message_get(request.id, target)
+            }
+            Method::AgentMessageMarkRead(target) => {
+                return self.handle_agent_message_mark_read(request.id, target)
+            }
             Method::AgentWait(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1236,6 +1258,7 @@ impl App {
             | Method::TerminalResize(_)
             | Method::TabSetGeometry(_)
             | Method::TabClaimGeometry(_)
+            | Method::TabReleaseGeometry(_)
             | Method::ControlList(_) => {
                 return responses::encode_error(
                     request.id,

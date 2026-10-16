@@ -880,7 +880,7 @@ fn agent_commands_work() {
     let renamed = run_cli(&socket_path, &["agent", "rename", &root_pane_id, "worker"]);
     assert!(renamed.status.success());
 
-    let listed = run_cli_json(&socket_path, &["agent", "list"]);
+    let listed = run_cli_json(&socket_path, &["agent", "list", "--flat"]);
     assert_eq!(listed["result"]["type"], "agent_list");
     assert_eq!(listed["result"]["agents"][0]["terminal_id"], terminal_id);
     assert_eq!(listed["result"]["agents"][0]["name"], "worker");

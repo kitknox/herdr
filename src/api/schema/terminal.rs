@@ -36,6 +36,17 @@ pub struct TabClaimGeometryParams {
     pub attach_id: Option<String>,
 }
 
+/// `tab.release_geometry`: give up a tab's geometry and forget the size
+/// this stream stored for it, so neither a successor hand-off nor input
+/// claims it back. `attach_id` names the tab through an attach instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct TabReleaseGeometryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_id: Option<String>,
+}
+
 /// One open control stream, as `control.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ControlConnectionInfo {
@@ -122,6 +133,10 @@ pub struct TerminalAttachParams {
     pub history_limit_bytes: Option<u64>,
     #[serde(default)]
     pub answer_queries: TerminalQueryAuthority,
+    /// Continue from this point of the terminal's output instead of taking
+    /// a snapshot, when the server still holds the bytes after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TerminalResumePoint>,
     #[serde(default)]
     pub takeover: bool,
     #[serde(default)]
@@ -139,6 +154,24 @@ pub struct TerminalAttachParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TerminalAttachTarget {
     pub attach_id: String,
+}
+
+/// `terminal.snapshot`: resynchronize an attach, by its output since
+/// `resume` when the server still holds it, else by a fresh snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalSnapshotParams {
+    pub attach_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TerminalResumePoint>,
+}
+
+/// A byte offset into one terminal's output. `epoch` changes whenever the
+/// terminal's screen changes without output (resize, clear) or the server
+/// restarts, so an offset from another epoch cannot resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalResumePoint {
+    pub epoch: u64,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -291,6 +324,9 @@ pub struct TerminalSnapshot {
     pub state: TerminalStateInfo,
     /// True when `history_limit_bytes` cut older history.
     pub truncated: bool,
+    /// The output position this snapshot reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<TerminalResumePoint>,
 }
 
 /// Records pushed on a control stream outside request/response pairs.
@@ -308,6 +344,17 @@ pub enum ControlRecord {
         seq: u64,
         /// Base64 raw PTY bytes.
         bytes: String,
+        /// Output position of the first byte.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+    },
+    /// The attach continues from `resume` without a snapshot; the output
+    /// records that follow start at its offset.
+    #[serde(rename = "terminal.resumed")]
+    Resumed {
+        attach_id: String,
+        seq: u64,
+        resume: TerminalResumePoint,
     },
     /// Output was dropped because the client fell behind; request
     /// `terminal.snapshot` to resynchronize.

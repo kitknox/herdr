@@ -4,6 +4,7 @@
 //! - `actions.rs` — state mutations (testable without PTYs/async)
 
 pub(crate) mod actions;
+mod agent_messages;
 mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
@@ -109,6 +110,7 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    pub(crate) agent_messages: agent_messages::MessageStore,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) policy: AppPolicy,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
@@ -186,6 +188,13 @@ fn load_plugin_registry(
         .into_iter()
         .map(|plugin| (plugin.plugin_id.clone(), plugin))
         .collect()
+}
+
+fn load_agent_messages(persist_session: bool) -> agent_messages::MessageStore {
+    if !persist_session {
+        return agent_messages::MessageStore::in_memory();
+    }
+    agent_messages::MessageStore::open(crate::persist::agent_messages::messages_path())
 }
 
 fn agent_panel_sort_from_config(
@@ -508,6 +517,7 @@ impl App {
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
+            control_resume_bytes: config.advanced.control_resume_bytes,
             sound: config.ui.sound.clone(),
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
@@ -620,6 +630,7 @@ impl App {
             last_presentation_at: None,
             api_rx,
             event_hub,
+            agent_messages: load_agent_messages(policy.persist_session),
             last_focus,
             policy,
             render_notify,
@@ -906,6 +917,7 @@ impl App {
 
         if !invalid_section("advanced") {
             self.state.pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes;
+            self.state.control_resume_bytes = config.advanced.control_resume_bytes;
         }
 
         if !invalid_section("update") {

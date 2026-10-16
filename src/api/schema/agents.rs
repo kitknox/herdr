@@ -181,11 +181,14 @@ pub struct AgentPromptParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<super::messages::RequestCaller>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
+    /// Agent name; accepted as an `agent.prompt` and `agent.message.send` target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,10 +209,12 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,
+    /// The session's `value` is accepted as an `agent.prompt` and `agent.message.send` target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,
     pub tab_id: String,
+    /// Accepted as an `agent.prompt` and `agent.message.send` target.
     pub pane_id: String,
     pub focused: bool,
     #[serde(default, skip_serializing_if = "super::is_false")]

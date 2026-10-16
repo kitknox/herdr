@@ -216,4 +216,6 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+    /// The PTY write behind an agent message marked delivered failed.
+    AgentMessageSubmissionFailed { message_id: String, reason: String },
 }

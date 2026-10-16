@@ -106,12 +106,14 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.message.send`, `agent.message.list`, `agent.message.get`, `agent.message.mark_read`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+
+`agent.prompt` and `agent.message.send` accept an optional `caller` object with `pane_id` and `cwd`. Herdr resolves the sender's workspace, tab, agent, agent session, and working directory from its own state for that pane; callers cannot supply them. `agent.message.send` takes `text` and either `target` or `reply_to`, plus optional `subject`, `queue`, and `wait`. It returns `agent_message_sent` with the stored `message` and, once delivered, the target `agent`. `agent.message.list` filters by `pane`, `from`, `unread`, `thread`, and `limit`; without `pane` or `thread` it lists the caller pane's inbox. `agent.message.get` and `agent.message.mark_read` take a message `id`. See [CLI reference](/docs/cli-reference/#agents) for the delivery header format and statuses.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
@@ -847,6 +849,8 @@ updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
 `session.snapshot` should use this event to refresh the affected layout through
 an authoritative read; a delayed payload may predate their latest snapshot.
 
+Agent event subscriptions include `agent.prompted`, `agent.message_sent`, `agent.message_delivered`, `agent.message_failed`, and `agent.message_read`. `agent.prompted` carries the target `pane_id`, `workspace_id`, `agent`, and the herdr-resolved `sender`. Message events carry the full `message`, including its id, sender, target, and status. All five can be used as plugin `[[events]] on` hooks.
+
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
@@ -891,6 +895,7 @@ owned.
 {"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16,"chrome":"none"}}
 {"id":"h","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":100,"rows":30,"cell_width_px":8,"cell_height_px":16,"chrome":"none","claim":false}}
 {"id":"k","method":"tab.claim_geometry","params":{"tab_id":"w1:t1"}}
+{"id":"r","method":"tab.release_geometry","params":{"tab_id":"w1:t1"}}
 {"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
 {"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
 {"id":"l","method":"control.list","params":{}}
@@ -924,6 +929,16 @@ the pane's output lock, so every `terminal.output` record with a higher `seq`
 was produced after it. `history_limit_bytes` bounds the primary history
 (default 1 MiB, maximum 8 MiB) and `truncated` reports a cut. While the
 alternate screen is active only that screen is captured.
+
+Servers advertising `output_resume` keep the newest output of each attached
+terminal, 1 MiB unless `advanced.control_resume_bytes` says otherwise. Snapshots carry `resume` (`epoch`, `offset`), the output
+position they reflect, and every `terminal.output` record carries the `offset`
+of its first byte. A `terminal.attach` or `terminal.snapshot` with `resume` set
+to a position still held gets a `terminal.resumed` record (`attach_id`, `seq`,
+`resume`) instead of a snapshot, followed by the output since that position, so
+the client continues the screen and history it already has. Anything the server
+no longer holds, a resize, a clear, or a server restart changes the epoch or
+drops the bytes, and the request falls back to a full snapshot.
 
 `terminal.output` carries raw PTY bytes as base64 with a per-attach `seq`. When
 a client falls behind, the server drops output and sends `terminal.gap`;
@@ -970,7 +985,11 @@ geometry, so selecting or copying from a pane does not resize it. The last
 stream to claim or type therefore wins, matching the rule for Herdr clients
 viewing the tab. When the owning stream closes, the tab passes to the
 remaining stream that most recently claimed or typed on it and stored a size,
-otherwise back to the viewing Herdr clients.
+otherwise back to the viewing Herdr clients. Servers advertising `geometry_release`
+accept `tab.release_geometry` (`tab_id` or `attach_id`): the stream forgets the
+size it stored for the tab and, when it owns the tab, hands it on by the same
+rule without closing. A released stream claims the tab again only with a new
+`tab.set_geometry` or `tab.set_pane_geometry`.
 
 Every geometry change while a control stream is open, whichever client caused
 it, sends a `tab.layout` record to every stream before the terminals are

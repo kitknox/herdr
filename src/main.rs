@@ -439,6 +439,10 @@ pane_history = false
 # Maximum scrollback buffer size in bytes retained per pane terminal.
 # Matches Ghostty's default scrollback-limit behavior.
 # scrollback_limit_bytes = 10000000
+# Recent output in bytes each control-attached terminal keeps so a
+# reconnecting control client can resume instead of taking a snapshot.
+# Applies from the next attach; capped at 64 MiB.
+# control_resume_bytes = 1048576
 "##;
 
 // Bundled at build time so the printed skill always matches this binary's release.

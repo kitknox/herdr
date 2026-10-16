@@ -42,7 +42,7 @@ use self::agent_detection::{
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::raw_stream::{RawInputSink, RawTapBudget, RawTapRegistry};
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
@@ -3410,6 +3410,7 @@ impl PaneRuntime {
             })
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
+        self.raw_taps.invalidate_resume();
         // A raw-tap client replays this byte stream itself: the model must
         // stay a pure function of it, so no recovery text is written back.
         let mut terminal_responses = if self.raw_taps.has_taps() {
@@ -3462,6 +3463,9 @@ impl PaneRuntime {
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let result = self.terminal.clear_screen();
         self.content_seq.fetch_add(1, Ordering::Release);
+        if result.is_ok() {
+            self.raw_taps.invalidate_resume();
+        }
         if result.is_ok() && self.raw_taps.has_taps() {
             // The clear writes no PTY output, so raw clients would keep
             // showing what it removed.
@@ -3771,6 +3775,7 @@ impl PaneRuntime {
         budget: Arc<RawTapBudget>,
         suppress_terminal_responses: bool,
         protocol: u32,
+        resume_bytes: usize,
     ) {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
@@ -3782,6 +3787,7 @@ impl PaneRuntime {
             budget,
             suppress_terminal_responses,
             protocol,
+            resume_bytes,
         );
     }
 
@@ -3805,14 +3811,20 @@ impl PaneRuntime {
         self.raw_taps.set_authority(attach_id);
     }
 
-    /// Emit a snapshot on a live tap, ordered against output.
-    pub(crate) fn snapshot_raw(&self, attach_id: &str, history_limit_bytes: usize) -> bool {
+    /// Emit a snapshot on a live tap, ordered against output, or continue
+    /// it from `resume` when the output since is still held.
+    pub(crate) fn snapshot_raw(
+        &self,
+        attach_id: &str,
+        history_limit_bytes: usize,
+        resume: Option<crate::api::schema::TerminalResumePoint>,
+    ) -> bool {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         self.raw_taps
-            .send_snapshot(attach_id, history_limit_bytes, |seq| {
+            .send_snapshot(attach_id, history_limit_bytes, resume, |seq| {
                 self.raw_snapshot_locked(seq, history_limit_bytes)
             })
     }
@@ -4277,6 +4289,7 @@ mod tests {
             Arc::new(RawTapBudget::new(1 << 20)),
             true,
             2,
+            1 << 20,
         );
         let (unarmed_tx, unarmed_rx) = std::sync::mpsc::channel();
         runtime.attach_raw(
@@ -4285,8 +4298,9 @@ mod tests {
             Arc::new(RawTapBudget::new(1 << 20)),
             true,
             2,
+            1 << 20,
         );
-        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20, None));
         runtime.test_process_pty_bytes(b"typed");
         let _ = rx.try_iter().count();
 
@@ -4323,6 +4337,7 @@ mod tests {
             Arc::new(RawTapBudget::new(1 << 20)),
             true,
             1,
+            1 << 20,
         );
         runtime.set_raw_query_authority(Some("1-0"));
         // Output before the first snapshot never streams: the snapshot covers
@@ -4330,7 +4345,7 @@ mod tests {
         assert!(!runtime.raw_taps.suppress_terminal_responses());
         runtime.test_process_pty_bytes(b"early ");
         assert!(rx.try_recv().is_err(), "unarmed tap must stay silent");
-        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20, None));
         assert!(runtime.raw_taps.suppress_terminal_responses());
 
         runtime.test_process_pty_bytes(b"world");
@@ -4365,7 +4380,7 @@ mod tests {
             other => panic!("expected output second, got {other:?}"),
         }
 
-        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20, None));
         match rx.try_recv() {
             Ok(ControlOutbound::Snapshot { snapshot, .. }) => {
                 assert_eq!(snapshot.seq, 1);
@@ -4404,9 +4419,10 @@ mod tests {
             Arc::new(RawTapBudget::new(1 << 20)),
             true,
             1,
+            1 << 20,
         );
         runtime.set_raw_query_authority(Some("1-0"));
-        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20, None));
         runtime.test_process_pty_bytes(b"6n");
 
         let records = rx.try_iter().collect::<Vec<_>>();
@@ -4455,8 +4471,9 @@ mod tests {
             Arc::new(RawTapBudget::new(1 << 20)),
             true,
             1,
+            1 << 20,
         );
-        assert!(runtime.snapshot_raw("1-0", 1 << 20));
+        assert!(runtime.snapshot_raw("1-0", 1 << 20, None));
         let _ = rx.try_iter().count();
 
         // Growing the screen leaves the bottom blank, which is exactly when

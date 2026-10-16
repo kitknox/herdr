@@ -1,3 +1,4 @@
+mod agent_messages;
 mod agent_options;
 mod agent_transport;
 mod agent_wait;

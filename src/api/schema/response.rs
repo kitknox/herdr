@@ -6,6 +6,7 @@ use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
+use super::messages::AgentMessage;
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
@@ -103,6 +104,18 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+    },
+    AgentMessageSent {
+        message: AgentMessage,
+        /// The target agent after delivery; absent while the message is queued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentInfo>,
+    },
+    AgentMessageList {
+        messages: Vec<AgentMessage>,
+    },
+    AgentMessageInfo {
+        message: AgentMessage,
     },
     AgentList {
         agents: Vec<AgentInfo>,

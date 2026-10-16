@@ -74,6 +74,7 @@ pub(crate) fn config_diagnostic_summary_without_keybindings(
     config_diagnostic_summary(&diagnostics)
 }
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
+pub const DEFAULT_CONTROL_RESUME_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;

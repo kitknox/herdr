@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    ErrorBody, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -84,24 +84,48 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let submission = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => {
+                self.queue_agent_prompt(request.id, params)
+            }
+            crate::api::schema::Method::AgentMessageSend(params) => {
+                self.queue_agent_message_send(request.id, params)
+            }
+            _ => return false,
         };
-        match self.queue_agent_prompt(request.id, params) {
-            Ok((id, agent, completion)) => {
+        match submission {
+            Ok(DeferredSubmission::Pending {
+                id,
+                result,
+                completion,
+                message_id,
+            }) => {
+                let event_tx = self.event_tx.clone();
                 std::thread::spawn(move || {
-                    let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                    let outcome = match completion.recv() {
+                        Ok(Ok(())) => Ok(()),
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
-                            encode_error(id, "timeout", err.to_string())
+                            Err(("timeout", err.to_string()))
                         }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
-                        Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
+                        Ok(Err(err)) => Err(("agent_prompt_failed", err.to_string())),
+                        Err(_) => Err(("agent_prompt_failed", "pty actor closed".to_string())),
                     };
+                    let response = match &outcome {
+                        Ok(()) => encode_success(id, *result),
+                        Err((code, message)) => encode_error(id, code, message.clone()),
+                    };
+                    if let (Some(message_id), Err((code, _))) = (message_id, &outcome) {
+                        let _ = event_tx.blocking_send(
+                            crate::events::AppEvent::AgentMessageSubmissionFailed {
+                                message_id,
+                                reason: (*code).to_string(),
+                            },
+                        );
+                    }
                     let _ = respond_to.send(response);
                 });
             }
-            Err(response) => {
+            Ok(DeferredSubmission::Done(response)) | Err(response) => {
                 let _ = respond_to.send(response);
             }
         }
@@ -112,14 +136,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<DeferredSubmission, String> {
         if params.text.is_empty() {
             return Err(encode_error(
                 id,
@@ -131,47 +148,6 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
-        let Some(terminal_id) = self
-            .state
-            .workspaces
-            .get(resolved.ws_idx)
-            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
-            .cloned()
-        else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        if terminal.state == crate::detect::AgentState::Blocked {
-            return Err(encode_error(
-                id,
-                "agent_blocked",
-                format!(
-                    "agent {} is blocked and requires interactive input",
-                    params.target
-                ),
-            ));
-        }
-        let Some(expected_agent) = terminal.effective_known_agent() else {
-            return Err(agent_not_ready(id, &params.target));
-        };
-        if terminal.managed_agent_launch_pending() {
-            return Err(agent_not_ready(id, &params.target));
-        }
-        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return Err(encode_error(
-                id,
-                "agent_not_ready",
-                format!(
-                    "agent {} is no longer the pane foreground process",
-                    params.target
-                ),
-            ));
-        }
         #[cfg(windows)]
         let submit_deadline = params
             .wait
@@ -179,20 +155,82 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
+        let (agent, completion) = self
+            .submit_agent_text(&params.target, &resolved, &params.text, submit_deadline)
+            .map_err(|err| encode_error_body(id.clone(), err))?;
+        let sender = self.resolve_request_sender(params.caller.as_ref());
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::AgentPrompted,
+            data: crate::api::schema::EventData::AgentPrompted {
+                pane_id: agent.pane_id.clone(),
+                workspace_id: agent.workspace_id.clone(),
+                agent: agent.agent.clone(),
+                sender,
+            },
+        });
+        Ok(DeferredSubmission::Pending {
+            id,
+            result: Box::new(ResponseResult::AgentPrompted { agent }),
+            completion,
+            message_id: None,
+        })
+    }
+
+    pub(super) fn submit_agent_text(
+        &mut self,
+        target: &str,
+        resolved: &crate::app::terminal_targets::TerminalTarget,
+        text: &str,
+        submit_deadline: Option<std::time::Instant>,
+    ) -> Result<
+        (
+            crate::api::schema::AgentInfo,
+            std::sync::mpsc::Receiver<std::io::Result<()>>,
+        ),
+        ErrorBody,
+    > {
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .cloned()
+        else {
+            return Err(agent_not_found_body(target));
+        };
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return Err(agent_not_found_body(target));
+        };
+        if terminal.state == crate::detect::AgentState::Blocked {
+            return Err(error_body(
+                "agent_blocked",
+                format!("agent {target} is blocked and requires interactive input"),
+            ));
+        }
+        let Some(expected_agent) = terminal.effective_known_agent() else {
+            return Err(agent_not_ready_body(target));
+        };
+        if terminal.managed_agent_launch_pending() {
+            return Err(agent_not_ready_body(target));
+        }
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found_body(target));
+        };
+        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+            return Err(error_body(
+                "agent_not_ready",
+                format!("agent {target} is no longer the pane foreground process"),
+            ));
+        }
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
-            let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
-                Ok(focus) => focus,
-                Err(err) => {
-                    return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
-                }
-            };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
-                return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
-            }
+            let focus = crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained)
+                .map_err(|err| error_body("agent_prompt_failed", err.to_string()))?;
+            runtime
+                .try_send_bytes(Bytes::from(focus))
+                .map_err(|err| error_body("agent_prompt_failed", err.to_string()))?;
         }
-        let (text, enter) =
-            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
+        let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, text);
         #[cfg(windows)]
         let text = if expected_agent == crate::detect::Agent::Codex {
             let mut text = text;
@@ -202,7 +240,7 @@ impl App {
             text
         };
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
+            return Err(agent_not_found_body(target));
         };
         let completion = runtime
             .queue_user_input_submission(
@@ -211,8 +249,8 @@ impl App {
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
             )
-            .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
-        Ok((id, agent, completion))
+            .map_err(|err| error_body("agent_prompt_failed", err.to_string()))?;
+        Ok((agent, completion))
     }
 
     pub(super) fn handle_agent_read(
@@ -373,6 +411,38 @@ impl App {
     }
 }
 
+pub(super) enum DeferredSubmission {
+    /// Text was queued to the PTY actor; respond with `result` once it is written.
+    Pending {
+        id: String,
+        result: Box<ResponseResult>,
+        completion: std::sync::mpsc::Receiver<std::io::Result<()>>,
+        message_id: Option<String>,
+    },
+    Done(String),
+}
+
+fn error_body(code: &str, message: impl Into<String>) -> ErrorBody {
+    ErrorBody {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn agent_not_ready_body(target: &str) -> ErrorBody {
+    error_body(
+        "agent_not_ready",
+        format!("agent {target} is not an active named agent"),
+    )
+}
+
+fn agent_not_found_body(target: &str) -> ErrorBody {
+    error_body(
+        "agent_not_found",
+        format!("agent target {target} not found"),
+    )
+}
+
 fn agent_not_ready(id: String, target: &str) -> String {
     encode_error(
         id,
@@ -460,6 +530,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                caller: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -560,6 +631,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                caller: None,
             },
         );
         assert!(response_rx.try_recv().is_err());
@@ -589,6 +661,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                caller: None,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -604,6 +677,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                caller: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -631,6 +705,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
+                caller: None,
             },
         );
 
@@ -671,6 +746,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                caller: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -750,6 +826,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                caller: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

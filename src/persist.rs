@@ -3,7 +3,9 @@
 //! Stored at `~/.config/herdr/session.json`.
 //! Optional pane screen history is stored separately at `session-history.json`.
 //! Installed plugins are persisted separately at `plugins.json`.
+//! Agent messages are appended to `agent-messages.jsonl`.
 
+pub mod agent_messages;
 mod io;
 pub mod plugin_registry;
 mod restore;

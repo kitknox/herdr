@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::common::{AgentStatus, ReadSource};
+use super::messages::{AgentMessage, AgentMessageSender};
 use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -84,6 +85,16 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "agent.prompted")]
+    AgentPrompted {},
+    #[serde(rename = "agent.message_sent")]
+    AgentMessageSent {},
+    #[serde(rename = "agent.message_delivered")]
+    AgentMessageDelivered {},
+    #[serde(rename = "agent.message_failed")]
+    AgentMessageFailed {},
+    #[serde(rename = "agent.message_read")]
+    AgentMessageRead {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -221,6 +232,11 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    AgentPrompted,
+    AgentMessageSent,
+    AgentMessageDelivered,
+    AgentMessageFailed,
+    AgentMessageRead,
 }
 
 impl EventKind {
@@ -253,6 +269,11 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::AgentPrompted => "agent.prompted",
+            EventKind::AgentMessageSent => "agent.message_sent",
+            EventKind::AgentMessageDelivered => "agent.message_delivered",
+            EventKind::AgentMessageFailed => "agent.message_failed",
+            EventKind::AgentMessageRead => "agent.message_read",
         }
     }
 }
@@ -286,6 +307,11 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::AgentPrompted,
+    EventKind::AgentMessageSent,
+    EventKind::AgentMessageDelivered,
+    EventKind::AgentMessageFailed,
+    EventKind::AgentMessageRead,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -311,6 +337,11 @@ pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::AgentPrompted,
+    EventKind::AgentMessageSent,
+    EventKind::AgentMessageDelivered,
+    EventKind::AgentMessageFailed,
+    EventKind::AgentMessageRead,
 ];
 
 #[cfg(test)]
@@ -564,5 +595,24 @@ pub enum EventData {
         geometry_controller: super::panes::GeometryController,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous: Option<super::panes::GeometryController>,
+    },
+    AgentPrompted {
+        pane_id: String,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        sender: AgentMessageSender,
+    },
+    AgentMessageSent {
+        message: AgentMessage,
+    },
+    AgentMessageDelivered {
+        message: AgentMessage,
+    },
+    AgentMessageFailed {
+        message: AgentMessage,
+    },
+    AgentMessageRead {
+        message: AgentMessage,
     },
 }

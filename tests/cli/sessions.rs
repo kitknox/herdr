@@ -818,7 +818,7 @@ fn server_start_restores_legacy_session_through_api_identity() {
         String::from_utf8_lossy(&reported.stderr)
     );
 
-    let agents = run_cli_json(&socket_path, &["agent", "list"]);
+    let agents = run_cli_json(&socket_path, &["agent", "list", "--flat"]);
     let agents = agents["result"]["agents"]
         .as_array()
         .expect("agent.list should return agents");

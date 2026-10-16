@@ -398,7 +398,12 @@ fn leftover_worktree_checkout_matches_repo(
 }
 
 fn git_common_worktrees_dir(repo_root: &Path, trust_repository: bool) -> Option<PathBuf> {
-    let output = repository_git_command(repo_root, trust_repository)
+    git_common_dir(repo_root, trust_repository).map(|common_dir| common_dir.join("worktrees"))
+}
+
+/// The `.git` directory shared by every checkout of the repository containing `dir`.
+pub(crate) fn git_common_dir(dir: &Path, trust_repository: bool) -> Option<PathBuf> {
+    let output = repository_git_command(dir, trust_repository)
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .ok()?;
@@ -413,12 +418,11 @@ fn git_common_worktrees_dir(repo_root: &Path, trust_repository: bool) -> Option<
         None
     } else {
         let common_dir = PathBuf::from(common_dir);
-        let common_dir = if common_dir.is_absolute() {
+        Some(if common_dir.is_absolute() {
             common_dir
         } else {
-            repo_root.join(common_dir)
-        };
-        Some(common_dir.join("worktrees"))
+            dir.join(common_dir)
+        })
     }
 }
 

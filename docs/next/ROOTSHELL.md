@@ -46,6 +46,28 @@ installer or package manager, then restart the server after saving work.
 Merging the feature upstream does not automatically migrate fork users. We will
 announce an official version containing the feature and migration instructions.
 
+## Resuming output
+
+Servers advertising the `output_resume` control feature keep the newest output
+of each attached terminal, addressed by byte offset within an epoch: 1 MiB by
+default, set with `advanced.control_resume_bytes` (capped at 64 MiB, applied
+from the next attach).
+Snapshots report `resume` (`epoch`, `offset`), and `terminal.output` records
+report the `offset` of their first byte. `terminal.attach` and
+`terminal.snapshot` accept `resume`: when the server still holds the output
+after that point, it sends `terminal.resumed` and the missed bytes instead of a
+snapshot. Resizes, clears, and server restarts start a new epoch, so a stale
+point always falls back to a full snapshot.
+
+## Releasing geometry
+
+Servers advertising the `geometry_release` control feature accept
+`tab.release_geometry` (`tab_id` or `attach_id`). The stream forgets the size it
+stored for the tab and, when it owns the tab, hands it to the remaining stream
+that most recently claimed or typed on it, else back to the viewing Herdr
+clients. Attaches stay open, so a client that stops showing a pane keeps its
+output without reopening the stream and replaying a snapshot.
+
 ## Control protocol 3
 
 Rootshell v0.1.7 adds `pane_geometry` and `tab.set_pane_geometry` for independent

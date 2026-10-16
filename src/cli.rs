@@ -23,6 +23,8 @@ macro_rules! println {
 }
 
 mod agent;
+mod agent_list;
+mod agent_message;
 mod api;
 mod completion;
 mod control;

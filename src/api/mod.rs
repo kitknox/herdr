@@ -55,6 +55,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
             | Method::AgentPrompt(_)
+            | Method::AgentMessageSend(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
             | Method::PaneSwap(_)
@@ -84,6 +85,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabSetGeometry(_)
             | Method::TabSetPaneGeometry(_)
             | Method::TabClaimGeometry(_)
+            | Method::TabReleaseGeometry(_)
     )
 }
 

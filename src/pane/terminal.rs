@@ -2076,6 +2076,7 @@ impl GhosttyPaneTerminal {
                 scroll,
             },
             truncated,
+            resume: None,
         })
     }
 

@@ -327,7 +327,7 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     assert!(matches!(paused_read.request.method, Method::PaneRead(_)));
     // Every batch must finish before the held app request can time out.
     let batches = EventHub::MAX_EVENTS / 128 + 1;
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    let deadline = Instant::now() + APP_RESPONSE_TIMEOUT - Duration::from_secs(1);
     for batch in 0..batches {
         let indices = batch * 128..(batch + 1) * 128;
         for index in indices.clone() {

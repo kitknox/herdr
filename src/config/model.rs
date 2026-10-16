@@ -1051,6 +1051,10 @@ pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+    /// Recent output in bytes each control-attached terminal keeps so a
+    /// reconnecting client can resume instead of taking a snapshot.
+    /// Default: 1048576.
+    pub control_resume_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1321,6 +1325,7 @@ impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
             scrollback_limit_bytes: DEFAULT_SCROLLBACK_LIMIT_BYTES,
+            control_resume_bytes: crate::config::DEFAULT_CONTROL_RESUME_BYTES,
         }
     }
 }
@@ -2098,6 +2103,20 @@ scrollback_limit_bytes = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+        assert_eq!(
+            config.advanced.control_resume_bytes,
+            crate::config::DEFAULT_CONTROL_RESUME_BYTES
+        );
+    }
+
+    #[test]
+    fn advanced_control_resume_bytes_parses() {
+        let toml = r#"
+[advanced]
+control_resume_bytes = 8388608
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.advanced.control_resume_bytes, 8 << 20);
     }
 
     #[test]

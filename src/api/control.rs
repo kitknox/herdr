@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use crate::api::schema::{TerminalDetachReason, TerminalSnapshot};
+use crate::api::schema::{TerminalDetachReason, TerminalResumePoint, TerminalSnapshot};
 use crate::pane::raw_stream::{RawInputSink, RawTapBudget};
 
 /// Version of the control stream contract advertised in `ping` capabilities.
@@ -49,6 +49,8 @@ pub const CONTROL_FEATURES: &[&str] = &[
     "event_gap",
     "auto_input",
     "pane_geometry",
+    "geometry_release",
+    "output_resume",
 ];
 
 /// One line or record queued for a control stream's writer thread.
@@ -63,8 +65,14 @@ pub(crate) enum ControlOutbound {
     Output {
         attach_id: String,
         seq: u64,
+        offset: Option<u64>,
         bytes: Bytes,
         budget: Arc<RawTapBudget>,
+    },
+    Resumed {
+        attach_id: String,
+        seq: u64,
+        resume: TerminalResumePoint,
     },
     Gap {
         attach_id: String,
