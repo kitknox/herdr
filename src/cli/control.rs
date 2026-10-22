@@ -158,7 +158,7 @@ fn forward_stdio(
 }
 
 fn ensure_server_running() -> io::Result<()> {
-    if crate::server::autodetect::is_server_listening() {
+    if crate::server::autodetect::is_server_listening()? {
         return Ok(());
     }
     crate::server::autodetect::spawn_server_daemon()?;
