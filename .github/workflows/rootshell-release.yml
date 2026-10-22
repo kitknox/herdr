@@ -141,9 +141,11 @@ jobs:
           prerelease: true
           generate_release_notes: true
           body: |
-            Rootshell v0.1.9 reports what each pane is running. `pane.get`, `pane.list`, and pane events now include an optional `foreground_process` object with the foreground job's `name`, its leading `argv` (at most 16 arguments of at most 256 bytes each), and `is_shell`, which is true only when the pane's own shell is sitting at a prompt. A program the pane was launched with, or one the shell `exec`s into, reports `false`. Herdr emits `pane.updated` when any of these change. Windows omits the field. This release remains based on Herdr v0.9.3 with control protocol 3 unchanged.
+            Rootshell v0.1.10 updates the fork to Herdr v0.9.5 while preserving control mode, shared terminal attaches, geometry ownership, independent pane grids (control protocol 3), and foreground process reporting. See the upstream notes for [v0.9.4](https://github.com/herdrdev/herdr/releases/tag/v0.9.4) and [v0.9.5](https://github.com/herdrdev/herdr/releases/tag/v0.9.5).
 
-            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.9`.
+            Control streams now close cleanly if the server cannot start a thread for them.
+
+            Existing Rootshell users: run `herdr update` from outside Herdr. The installed version should include `rootshell.0.1.10`.
 
             After installation completes, save work and restart existing servers: stopping a server terminates its pane processes. From outside Herdr: `herdr server stop`, then `herdr`. For a named session: `herdr session stop NAME`, then `herdr --session NAME`. Reconnect Rootshell afterward. Existing servers keep running their previous binary until restarted. Experimental live handoff is not recommended for this release.
 
