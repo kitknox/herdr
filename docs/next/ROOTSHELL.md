@@ -46,6 +46,15 @@ installer or package manager, then restart the server after saving work.
 Merging the feature upstream does not automatically migrate fork users. We will
 announce an official version containing the feature and migration instructions.
 
+## Releasing geometry
+
+Servers advertising the `geometry_release` control feature accept
+`tab.release_geometry` (`tab_id` or `attach_id`). The stream forgets the size it
+stored for the tab and, when it owns the tab, hands it to the remaining stream
+that most recently claimed or typed on it, else back to the viewing Herdr
+clients. Attaches stay open, so a client that stops showing a pane keeps its
+output without reopening the stream and replaying a snapshot.
+
 ## Control protocol 3
 
 Rootshell v0.1.7 adds `pane_geometry` and `tab.set_pane_geometry` for independent

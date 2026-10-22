@@ -893,6 +893,7 @@ owned.
 {"id":"g","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":120,"rows":40,"cell_width_px":8,"cell_height_px":16,"chrome":"none"}}
 {"id":"h","method":"tab.set_geometry","params":{"tab_id":"w1:t1","cols":100,"rows":30,"cell_width_px":8,"cell_height_px":16,"chrome":"none","claim":false}}
 {"id":"k","method":"tab.claim_geometry","params":{"tab_id":"w1:t1"}}
+{"id":"r","method":"tab.release_geometry","params":{"tab_id":"w1:t1"}}
 {"id":"i","method":"terminal.input","params":{"attach_id":"1-0","bytes":"bHMK"}}
 {"id":"s","method":"terminal.snapshot","params":{"attach_id":"1-0"}}
 {"id":"l","method":"control.list","params":{}}
@@ -972,7 +973,11 @@ geometry, so selecting or copying from a pane does not resize it. The last
 stream to claim or type therefore wins, matching the rule for Herdr clients
 viewing the tab. When the owning stream closes, the tab passes to the
 remaining stream that most recently claimed or typed on it and stored a size,
-otherwise back to the viewing Herdr clients.
+otherwise back to the viewing Herdr clients. Servers advertising `geometry_release`
+accept `tab.release_geometry` (`tab_id` or `attach_id`): the stream forgets the
+size it stored for the tab and, when it owns the tab, hands it on by the same
+rule without closing. A released stream claims the tab again only with a new
+`tab.set_geometry` or `tab.set_pane_geometry`.
 
 Every geometry change while a control stream is open, whichever client caused
 it, sends a `tab.layout` record to every stream before the terminals are

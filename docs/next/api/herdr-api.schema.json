@@ -5269,6 +5269,24 @@
           ],
           "type": "object"
         },
+        "TabReleaseGeometryParams": {
+          "description": "`tab.release_geometry`: give up a tab's geometry and forget the size\nthis stream stored for it, so neither a successor hand-off nor input\nclaims it back. `attach_id` names the tab through an attach instead.",
+          "properties": {
+            "attach_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "TabRenameParams": {
           "properties": {
             "label": {
@@ -7678,6 +7696,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/TabClaimGeometryParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.release_geometry",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabReleaseGeometryParams"
             }
           },
           "required": [

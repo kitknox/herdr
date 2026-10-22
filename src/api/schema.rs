@@ -271,6 +271,8 @@ pub enum Method {
     TabSetPaneGeometry(TabSetPaneGeometryParams),
     #[serde(rename = "tab.claim_geometry")]
     TabClaimGeometry(TabClaimGeometryParams),
+    #[serde(rename = "tab.release_geometry")]
+    TabReleaseGeometry(TabReleaseGeometryParams),
     #[serde(rename = "control.list")]
     ControlList(EmptyParams),
 }

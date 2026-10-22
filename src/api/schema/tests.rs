@@ -453,6 +453,16 @@ fn control_stream_requests_round_trip() {
     assert_eq!(params.tab_id.as_deref(), Some("w1:t1"));
     assert!(params.attach_id.is_none());
 
+    let release: Request = serde_json::from_str(
+        r#"{"id":"r","method":"tab.release_geometry","params":{"attach_id":"1-0"}}"#,
+    )
+    .unwrap();
+    let Method::TabReleaseGeometry(params) = &release.method else {
+        panic!("expected tab.release_geometry");
+    };
+    assert!(params.tab_id.is_none());
+    assert_eq!(params.attach_id.as_deref(), Some("1-0"));
+
     let list: Request =
         serde_json::from_str(r#"{"id":"l","method":"control.list","params":{}}"#).unwrap();
     assert!(matches!(list.method, Method::ControlList(_)));

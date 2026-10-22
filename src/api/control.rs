@@ -49,6 +49,7 @@ pub const CONTROL_FEATURES: &[&str] = &[
     "event_gap",
     "auto_input",
     "pane_geometry",
+    "geometry_release",
 ];
 
 /// One line or record queued for a control stream's writer thread.

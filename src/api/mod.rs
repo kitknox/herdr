@@ -84,6 +84,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabSetGeometry(_)
             | Method::TabSetPaneGeometry(_)
             | Method::TabClaimGeometry(_)
+            | Method::TabReleaseGeometry(_)
     )
 }
 

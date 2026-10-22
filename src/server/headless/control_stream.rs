@@ -12,9 +12,9 @@ use crate::api::control::{ControlConnectionHandle, CONTROL_STREAM_PROTOCOL};
 use crate::api::schema::{
     ControlAttachInfo, ControlClientInfo, ControlConnectionInfo, ControlTabInfo, ErrorBody,
     ErrorResponse, GeometryController, GeometryControllerKind, ResponseResult, SuccessResponse,
-    TabChrome, TabClaimGeometryParams, TabSetGeometryParams, TerminalAttachGeometry,
-    TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason, TerminalQueryAuthority,
-    TerminalResizeParams,
+    TabChrome, TabClaimGeometryParams, TabReleaseGeometryParams, TabSetGeometryParams,
+    TerminalAttachGeometry, TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason,
+    TerminalQueryAuthority, TerminalResizeParams,
 };
 use crate::pane::raw_stream::{RawTapBudget, DEFAULT_TAP_BUDGET_BYTES};
 use crate::protocol::ServerMessage;
@@ -160,6 +160,9 @@ impl HeadlessServer {
             }
             Method::TabClaimGeometry(params) => {
                 self.control_tab_claim_geometry(id, msg.control.as_ref(), params)
+            }
+            Method::TabReleaseGeometry(params) => {
+                self.control_tab_release_geometry(id, msg.control.as_ref(), params)
             }
             // A stream bootstraps from the same rectangles its `tab.layout`
             // records carry, not the TUI's view area.
@@ -451,14 +454,7 @@ impl HeadlessServer {
         self.tab_geometry_controllers
             .retain(|_, controller| *controller != connection_id);
         for tab_id in owned {
-            let successor = self
-                .control_connections
-                .iter()
-                .filter_map(|(id, state)| state.tab_geometry.get(&tab_id).map(|g| (*id, *g)))
-                .max_by_key(|(_, geometry)| geometry.last_interaction);
-            if let Some((successor_id, geometry)) = successor {
-                self.claim_control_tab_geometry(successor_id, &tab_id, geometry);
-            }
+            self.hand_off_control_tab_geometry(&tab_id);
         }
         self.sync_control_geometry_tabs();
         for terminal_id in terminals {
@@ -1152,44 +1148,15 @@ impl HeadlessServer {
             Ok(connection_id) => connection_id,
             Err(message) => return error(id, "control_stream_required", message),
         };
-        let tab_id = match (&params.tab_id, &params.attach_id) {
-            (Some(tab_id), _) => tab_id.clone(),
-            (None, Some(attach_id)) => {
-                let terminal_id = self
-                    .control_connections
-                    .get(&connection_id)
-                    .and_then(|state| state.attaches.get(attach_id))
-                    .map(|attach| attach.terminal_id.clone());
-                let Some(terminal_id) = terminal_id else {
-                    return error(
-                        id,
-                        "unknown_attach",
-                        format!("attach {attach_id} is not live"),
-                    );
-                };
-                let Some(tab_id) = self
-                    .tab_target_for_terminal(&terminal_id)
-                    .and_then(|target| self.tab_id_for_target(target))
-                else {
-                    return error(
-                        id,
-                        "not_found",
-                        format!("terminal {terminal_id} is not in a tab"),
-                    );
-                };
-                tab_id
-            }
-            (None, None) => {
-                return error(
-                    id,
-                    "invalid_request",
-                    "tab.claim_geometry needs tab_id or attach_id".into(),
-                );
-            }
+        let tab_id = match self.control_geometry_tab_id(
+            connection_id,
+            params.tab_id.as_deref(),
+            params.attach_id.as_deref(),
+            "tab.claim_geometry",
+        ) {
+            Ok(tab_id) => tab_id,
+            Err((code, message)) => return error(id, code, message),
         };
-        if self.app.parse_tab_id(&tab_id).is_none() {
-            return error(id, "not_found", format!("tab {tab_id} not found"));
-        }
         let stamp = self.allocate_activity_stamp();
         let Some(geometry) = self
             .control_connections
@@ -1206,6 +1173,93 @@ impl HeadlessServer {
         let geometry = *geometry;
         self.claim_control_tab_geometry(connection_id, &tab_id, geometry);
         success(id, ResponseResult::Ok {})
+    }
+
+    fn control_tab_release_geometry(
+        &mut self,
+        id: String,
+        handle: Option<&ControlConnectionHandle>,
+        params: &TabReleaseGeometryParams,
+    ) -> String {
+        let connection_id = match self.control_connection_id(handle) {
+            Ok(connection_id) => connection_id,
+            Err(message) => return error(id, "control_stream_required", message),
+        };
+        let tab_id = match self.control_geometry_tab_id(
+            connection_id,
+            params.tab_id.as_deref(),
+            params.attach_id.as_deref(),
+            "tab.release_geometry",
+        ) {
+            Ok(tab_id) => tab_id,
+            Err((code, message)) => return error(id, code, message),
+        };
+        if let Some(state) = self.control_connections.get_mut(&connection_id) {
+            state.tab_geometry.remove(&tab_id);
+            state.tab_pane_geometry.remove(&tab_id);
+        }
+        if self.tab_geometry_controllers.get(&tab_id) == Some(&connection_id) {
+            self.tab_geometry_controllers.remove(&tab_id);
+            self.hand_off_control_tab_geometry(&tab_id);
+            if !self.resize_tabs_for_only_shell_client(true) {
+                self.reapply_controlled_shell_tab_geometry(true);
+            }
+        }
+        self.sync_control_geometry_tabs();
+        success(id, ResponseResult::Ok {})
+    }
+
+    /// The tab a geometry request names, directly or through an attach of
+    /// this connection.
+    fn control_geometry_tab_id(
+        &self,
+        connection_id: u64,
+        tab_id: Option<&str>,
+        attach_id: Option<&str>,
+        method: &str,
+    ) -> Result<String, (&'static str, String)> {
+        let tab_id = match (tab_id, attach_id) {
+            (Some(tab_id), _) => tab_id.to_owned(),
+            (None, Some(attach_id)) => {
+                let terminal_id = self
+                    .control_connections
+                    .get(&connection_id)
+                    .and_then(|state| state.attaches.get(attach_id))
+                    .map(|attach| attach.terminal_id.clone())
+                    .ok_or_else(|| ("unknown_attach", format!("attach {attach_id} is not live")))?;
+                self.tab_target_for_terminal(&terminal_id)
+                    .and_then(|target| self.tab_id_for_target(target))
+                    .ok_or_else(|| {
+                        (
+                            "not_found",
+                            format!("terminal {terminal_id} is not in a tab"),
+                        )
+                    })?
+            }
+            (None, None) => {
+                return Err((
+                    "invalid_request",
+                    format!("{method} needs tab_id or attach_id"),
+                ));
+            }
+        };
+        if self.app.parse_tab_id(&tab_id).is_none() {
+            return Err(("not_found", format!("tab {tab_id} not found")));
+        }
+        Ok(tab_id)
+    }
+
+    /// Passes an unowned tab to the connection that most recently interacted
+    /// with a size it stored for it, if any.
+    fn hand_off_control_tab_geometry(&mut self, tab_id: &str) {
+        let successor = self
+            .control_connections
+            .iter()
+            .filter_map(|(id, state)| state.tab_geometry.get(tab_id).map(|g| (*id, *g)))
+            .max_by_key(|(_, geometry)| geometry.last_interaction);
+        if let Some((successor_id, geometry)) = successor {
+            self.claim_control_tab_geometry(successor_id, tab_id, geometry);
+        }
     }
 
     /// Makes a control connection the tab's geometry controller and lays

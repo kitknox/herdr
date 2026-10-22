@@ -3,9 +3,9 @@ use super::*;
 use crate::api::control::{ControlConnectionHandle, ControlOutbound};
 use crate::api::schema::{
     ControlClientInfo, ControlOpenParams, EmptyParams, Method, Request, TabChrome,
-    TabClaimGeometryParams, TabSetGeometryParams, TabTarget, TerminalAttachGeometry,
-    TerminalAttachMode, TerminalAttachParams, TerminalAttachTarget, TerminalDetachReason,
-    TerminalInputParams, TerminalQueryAuthority,
+    TabClaimGeometryParams, TabReleaseGeometryParams, TabSetGeometryParams, TabTarget,
+    TerminalAttachGeometry, TerminalAttachMode, TerminalAttachParams, TerminalAttachTarget,
+    TerminalDetachReason, TerminalInputParams, TerminalQueryAuthority,
 };
 
 /// Sends a request as a control stream would and returns the response the
@@ -922,6 +922,135 @@ async fn owner_disconnect_hands_tab_to_latest_remaining_geometry() {
     close_control(&mut server, &a);
     assert!(server.tab_geometry_controllers.is_empty());
     assert!(server.control_connections.is_empty());
+}
+
+fn release_tab_geometry(
+    server: &mut HeadlessServer,
+    handle: &ControlConnectionHandle,
+    params: TabReleaseGeometryParams,
+) -> serde_json::Value {
+    send_control(server, handle, Method::TabReleaseGeometry(params)).expect("release response")
+}
+
+#[tokio::test]
+async fn release_hands_tab_on_and_forgets_the_stored_size() {
+    let mut server = test_headless_server();
+    let _input_rx = install_focused_test_runtime(&mut server, b"");
+    let (pane_id, tab_id) = focused_ids(&server);
+    let (a, a_rx, a_id) = open_control_v2(&mut server, "a");
+    let (b, b_rx, b_id) = open_control_v2(&mut server, "b");
+    let a_attach = attach_id_of(&attach(&mut server, &a, &a_rx, attach_params(&pane_id)));
+    let b_attach = attach_id_of(&attach(&mut server, &b, &b_rx, attach_params(&pane_id)));
+    store_tab_geometry(&mut server, &a, &tab_id, 90, 20);
+    set_tab_geometry(&mut server, &b, &tab_id, 120, 40);
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&b_id));
+
+    let released = release_tab_geometry(
+        &mut server,
+        &b,
+        TabReleaseGeometryParams {
+            tab_id: None,
+            attach_id: Some(b_attach.clone()),
+        },
+    );
+    assert_eq!(released["result"]["type"], "ok", "{released}");
+    assert_eq!(
+        server.tab_geometry_controllers.get(&tab_id),
+        Some(&a_id),
+        "the remaining stored size takes the tab"
+    );
+    assert_eq!(focused_runtime(&server).current_size(), (20, 90));
+    assert!(
+        !b.take_claim_on_input(&b_attach),
+        "a released size does not claim the tab back on input"
+    );
+    let reclaim = claim_tab_geometry(
+        &mut server,
+        &b,
+        TabClaimGeometryParams {
+            tab_id: Some(tab_id.clone()),
+            attach_id: None,
+        },
+    );
+    assert_eq!(reclaim["error"]["code"], "no_geometry");
+    assert_eq!(server.control_connections.len(), 2, "the stream stays open");
+    let records = drain(&b_rx);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["type"] == "terminal.detached"),
+        "the attach survives the release: {records:?}"
+    );
+
+    let released = release_tab_geometry(
+        &mut server,
+        &a,
+        TabReleaseGeometryParams {
+            tab_id: Some(tab_id.clone()),
+            attach_id: None,
+        },
+    );
+    assert_eq!(released["result"]["type"], "ok", "{released}");
+    assert!(!server.tab_geometry_controllers.contains_key(&tab_id));
+    assert!(!a.take_claim_on_input(&a_attach));
+
+    set_tab_geometry(&mut server, &b, &tab_id, 100, 30);
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&b_id));
+    assert_eq!(focused_runtime(&server).current_size(), (30, 100));
+}
+
+#[tokio::test]
+async fn release_by_a_non_owner_only_forgets_its_size() {
+    let mut server = test_headless_server();
+    let _input_rx = install_focused_test_runtime(&mut server, b"");
+    let (pane_id, tab_id) = focused_ids(&server);
+    let (a, a_rx, a_id) = open_control_v2(&mut server, "a");
+    let (b, b_rx, _) = open_control_v2(&mut server, "b");
+    attach_id_of(&attach(&mut server, &a, &a_rx, attach_params(&pane_id)));
+    attach_id_of(&attach(&mut server, &b, &b_rx, attach_params(&pane_id)));
+    set_tab_geometry(&mut server, &a, &tab_id, 120, 40);
+    store_tab_geometry(&mut server, &b, &tab_id, 100, 30);
+
+    let released = release_tab_geometry(
+        &mut server,
+        &b,
+        TabReleaseGeometryParams {
+            tab_id: Some(tab_id.clone()),
+            attach_id: None,
+        },
+    );
+    assert_eq!(released["result"]["type"], "ok", "{released}");
+    assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&a_id));
+    assert_eq!(focused_runtime(&server).current_size(), (40, 120));
+
+    close_control(&mut server, &a);
+    assert!(
+        !server.tab_geometry_controllers.contains_key(&tab_id),
+        "the released size is not a successor"
+    );
+}
+
+#[tokio::test]
+async fn release_needs_a_control_stream_and_a_tab() {
+    let mut server = test_headless_server();
+    let _input_rx = install_focused_test_runtime(&mut server, b"");
+    let (a, _a_rx, _) = open_control_v2(&mut server, "a");
+    let missing = release_tab_geometry(&mut server, &a, TabReleaseGeometryParams::default());
+    assert_eq!(missing["error"]["code"], "invalid_request");
+    let unknown = release_tab_geometry(
+        &mut server,
+        &a,
+        TabReleaseGeometryParams {
+            tab_id: None,
+            attach_id: Some("9-9".into()),
+        },
+    );
+    assert_eq!(unknown["error"]["code"], "unknown_attach");
+    let plain = send_plain(
+        &mut server,
+        Method::TabReleaseGeometry(TabReleaseGeometryParams::default()),
+    );
+    assert_eq!(plain["error"]["code"], "control_stream_required");
 }
 
 #[tokio::test]

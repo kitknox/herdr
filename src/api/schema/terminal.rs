@@ -36,6 +36,17 @@ pub struct TabClaimGeometryParams {
     pub attach_id: Option<String>,
 }
 
+/// `tab.release_geometry`: give up a tab's geometry and forget the size
+/// this stream stored for it, so neither a successor hand-off nor input
+/// claims it back. `attach_id` names the tab through an attach instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct TabReleaseGeometryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_id: Option<String>,
+}
+
 /// One open control stream, as `control.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ControlConnectionInfo {

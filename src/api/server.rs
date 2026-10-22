@@ -745,6 +745,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::TabSetGeometry(_) => "tab.set_geometry",
         Method::TabSetPaneGeometry(_) => "tab.set_pane_geometry",
         Method::TabClaimGeometry(_) => "tab.claim_geometry",
+        Method::TabReleaseGeometry(_) => "tab.release_geometry",
         Method::ControlList(_) => "control.list",
     }
 }
