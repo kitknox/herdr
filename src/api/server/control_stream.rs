@@ -85,7 +85,15 @@ pub(super) fn serve(
     // The writer must not hold a handle: a handle owns an outbound sender,
     // and the writer only exits once every sender is gone.
     let writer_alive = handle.alive_flag();
-    let writer = std::thread::spawn(move || writer_loop(writer_stream, outbound_rx, writer_alive));
+    let writer = match crate::thread_spawn::spawn_named("herdr-control-writer", move || {
+        writer_loop(writer_stream, outbound_rx, writer_alive)
+    }) {
+        Ok(writer) => writer,
+        Err(err) => {
+            close_on_app(&handle, api_tx);
+            return Err(err);
+        }
+    };
 
     let subscriptions: Arc<Mutex<Vec<ActiveSubscription>>> = Arc::default();
     let poller = {
@@ -94,7 +102,7 @@ pub(super) fn serve(
         let api_tx = api_tx.clone();
         let event_hub = event_hub.clone();
         let running = Arc::clone(running);
-        std::thread::spawn(move || {
+        crate::thread_spawn::spawn_named("herdr-control-events", move || {
             // Every subscription reports the same ring gap; announce it once.
             let mut announced_gap = None;
             'poll: while handle.is_alive() && running.load(Ordering::Relaxed) {
@@ -126,6 +134,16 @@ pub(super) fn serve(
                 std::thread::sleep(CONNECTION_POLL_INTERVAL);
             }
         })
+    };
+    let poller = match poller {
+        Ok(poller) => poller,
+        Err(err) => {
+            // Closing drops the app's outbound senders, so the writer exits.
+            close_on_app(&handle, api_tx);
+            drop(handle);
+            let _ = writer.join();
+            return Err(err);
+        }
     };
 
     let result = reader_loop(
@@ -628,5 +646,70 @@ mod tests {
         lines.push(b"a");
         assert_eq!(lines.room(), 0);
         assert!(lines.next_line().is_none());
+    }
+
+    /// Serves one control stream on this thread with the given spawn
+    /// failures injected, and returns what the app saw.
+    fn serve_with_spawn_failures(allowed: usize, failures: usize) -> (io::Result<()>, Vec<String>) {
+        use interprocess::local_socket::traits::Listener as _;
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "herdr-control-spawn-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let _client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                let crate::api::ApiRequestMessage {
+                    request,
+                    respond_to,
+                    ..
+                } = message;
+                let closing = matches!(request.method, Method::ControlClose(_));
+                seen.push(request.id.clone());
+                let _ = respond_to.send(format!(r#"{{"id":"{}","result":{{}}}}"#, request.id));
+                if closing {
+                    break;
+                }
+            }
+            seen
+        });
+
+        crate::thread_spawn::test_hook::fail_spawns_after(allowed, failures);
+        let result = serve(
+            server,
+            "open".into(),
+            ControlOpenParams::default(),
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        );
+        crate::thread_spawn::test_hook::fail_next_spawns(0);
+        drop(api_tx);
+        let seen = app.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        (result, seen)
+    }
+
+    #[test]
+    fn writer_spawn_failure_releases_the_connection() {
+        let (result, seen) = serve_with_spawn_failures(0, 1);
+        assert!(result.is_err());
+        assert_eq!(seen, ["open", "control:closed"]);
+    }
+
+    #[test]
+    fn event_poller_spawn_failure_releases_the_connection() {
+        let (result, seen) = serve_with_spawn_failures(1, 1);
+        assert!(result.is_err());
+        assert_eq!(seen, ["open", "control:closed"]);
     }
 }
