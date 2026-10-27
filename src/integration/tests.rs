@@ -1126,7 +1126,7 @@ fn claude_v1_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(1));
-    assert_eq!(claude.expected_version, 9);
+    assert_eq!(claude.expected_version, 10);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -1156,7 +1156,7 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 9);
+    assert_eq!(claude.expected_version, 10);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
